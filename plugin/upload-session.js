@@ -1,0 +1,117 @@
+#!/usr/bin/env node
+// Claudium plugin — SessionEnd hook. Builds the privacy-scrubbed usage record
+// for the session that just finished and POSTs it to Claudium Cloud; with the
+// local transcripts opt-in, also uploads secret/PII-redacted turns.
+//
+// CONTRACT: this process must NEVER disturb the user's session — every path
+// exits 0; failures go to stderr only. Config: ~/.claudium/plugin.json
+// { "url": "https://…", "token": "…", "transcripts": false }
+//
+// Self-contained: requires ONLY ./lib (vendored by scripts/build-plugin.js)
+// and Node built-ins. No npm install.
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { sessionize } = require('./lib/sessionize');
+const { computeMetrics } = require('./lib/metrics');
+const { extractAbstraction } = require('./lib/extract');
+const { buildRecord } = require('./lib/record');
+const { buildTranscriptTurns } = require('./lib/transcript');
+const { getProjectName } = require('./lib/parse');
+
+const CONFIG_PATH = path.join(os.homedir(), '.claudium', 'plugin.json');
+const CLAUDE_DIR = process.env.CLAUDE_DIR || path.join(os.homedir(), '.claude', 'projects');
+
+function loadConfig(p = CONFIG_PATH) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!cfg || typeof cfg.url !== 'string' || typeof cfg.token !== 'string') return null;
+    return { url: cfg.url, token: cfg.token, transcripts: cfg.transcripts === true };
+  } catch { return null; }
+}
+
+const isSubagentPath = p => /[/\\]subagents[/\\]/.test(String(p || ''));
+
+async function buildFor(filepath, claudeDir, { apiKey } = {}) {
+  if (isSubagentPath(filepath)) return null;
+  const raw = await fs.promises.readFile(filepath, 'utf8');
+  const lines = raw.split('\n').filter(l => l.trim());
+  if (!lines.length) return null;
+  const session = sessionize(lines, {
+    projectLabel: getProjectName(filepath, claudeDir),
+    claudeSessionId: path.basename(filepath, '.jsonl'),
+  });
+  if (!session.turnCount) return null;
+  const metrics = computeMetrics(session);
+  const abstraction = await extractAbstraction(session, { apiKey: apiKey || process.env.ANTHROPIC_API_KEY || '' });
+  let coachNudges = [];
+  try { coachNudges = require('./lib/coach-ledger').nudgesFor(session.claudeSessionId); } catch {}
+  return { record: buildRecord({ session, metrics, abstraction, coachNudges }), session };
+}
+
+async function post(base, apiPath, token, body, fetchImpl) {
+  return fetchImpl(base + apiPath, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+}
+
+async function uploadOne(filepath, claudeDir, cfg, fetchImpl = globalThis.fetch) {
+  try {
+    const built = await buildFor(filepath, claudeDir, {});
+    if (!built) return;
+    const base = String(cfg.url).replace(/\/+$/, '');
+    const r = await post(base, '/api/records', cfg.token, built.record, fetchImpl);
+    if (!r || !r.ok) { console.error(`claudium: record not stored (${r && r.status})`); return; }
+    if (cfg.transcripts) {
+      const turns = buildTranscriptTurns(built.session);
+      if (turns.length) {
+        const t = await post(base, '/api/transcripts', cfg.token,
+          { claude_session_id: built.record.claude_session_id, turns }, fetchImpl);
+        if (!t || !t.ok) console.error(`claudium: transcript not stored (${t && t.status})`);
+      }
+    }
+  } catch (e) { console.error(`claudium: upload failed: ${e.message}`); }
+}
+
+function readStdinJson() {
+  return new Promise((resolve) => {
+    let buf = '';
+    process.stdin.on('data', c => { buf += c; });
+    process.stdin.on('end', () => { try { resolve(JSON.parse(buf)); } catch { resolve(null); } });
+    process.stdin.on('error', () => resolve(null));
+  });
+}
+
+async function runHook() {
+  const cfg = loadConfig();
+  if (!cfg) { console.error('claudium: no config — run the connect setup from /connect first'); return; }
+  const input = await readStdinJson();
+  const fp = input && input.transcript_path;
+  if (!fp) { console.error('claudium: hook input had no transcript_path'); return; }
+  await uploadOne(fp, CLAUDE_DIR, cfg);
+}
+
+async function runBackfill() {
+  const cfg = loadConfig();
+  if (!cfg) { console.error('claudium: no config — run the connect setup from /connect first'); return; }
+  const walk = async (dir) => {
+    let ents = [];
+    try { ents = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const fp = path.join(dir, e.name);
+      if (e.isDirectory()) { if (e.name === 'subagents') continue; await walk(fp); }
+      else if (e.name.endsWith('.jsonl')) { process.stderr.write(`claudium: backfill ${e.name}\n`); await uploadOne(fp, CLAUDE_DIR, cfg); }
+    }
+  };
+  await walk(CLAUDE_DIR);
+}
+
+module.exports = { loadConfig, buildFor, uploadOne, runHook, runBackfill, CONFIG_PATH };
+
+if (require.main === module) {
+  const main = process.argv.includes('--backfill') ? runBackfill : runHook;
+  main().then(() => process.exit(0)).catch(e => { console.error(`claudium: ${e.message}`); process.exit(0); });
+}

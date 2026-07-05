@@ -1,0 +1,7 @@
+{
+  "name": "claudium",
+  "owner": { "name": "Claudium" },
+  "plugins": [
+    { "name": "claudium", "source": "./plugin", "description": "Claudium usage uploader — session-end hook" }
+  ]
+}
