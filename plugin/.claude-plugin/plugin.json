@@ -1,6 +1,6 @@
 {
   "name": "claudium",
   "description": "Uploads privacy-scrubbed Claude Code usage records (and opt-in redacted transcripts) to your team's Claudium dashboard when a session ends.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": { "name": "Claudium" }
 }

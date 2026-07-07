@@ -30,13 +30,19 @@ EOF
 
 Without this file the plugin does nothing — it never blocks or fails a session.
 
-## Import your history (optional)
+## Your history imports automatically
 
-Upload past sessions once:
+The first time the plugin runs after setup, it uploads your existing session
+history in the background — nothing to run. To import immediately instead:
 
 ```
 node "$(ls -d ~/.claude/plugins/cache/claudium/claudium/*/ 2>/dev/null | tail -1)upload-session.js" --backfill
 ```
+
+## Check it’s working
+
+Run `/claudium:status` inside Claude Code — it shows your config target,
+whether history has imported, and whether the server accepts your token.
 
 ## What gets uploaded
 
