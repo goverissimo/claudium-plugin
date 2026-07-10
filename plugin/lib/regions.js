@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // lib/regions.js — maps Claude Code tool names to brain regions.
 
 const TOOL_REGION = {

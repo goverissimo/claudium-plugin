@@ -1,5 +1,5 @@
 ---
-description: Show Claudium upload status — config, history import, server connectivity
+description: Show Claudium upload status — config, history import, classification mode and last cost, server connectivity
 ---
 
 Claudium upload status:

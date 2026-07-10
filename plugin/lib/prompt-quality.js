@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // lib/prompt-quality.js — Tier-0 prompt antipattern detection. Pure, no LLM.
 //
 // This is the "coach the human" layer: it looks at HOW the user asked, not

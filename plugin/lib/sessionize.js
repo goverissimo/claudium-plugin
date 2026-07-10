@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // lib/sessionize.js — turns a Claude Code session's JSONL lines into one
 // ordered Session object. Pure: no I/O, no network.
 //

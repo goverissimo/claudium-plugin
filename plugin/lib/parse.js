@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // lib/parse.js — turns Claude Code JSONL transcript lines into brain events.
 
 const os = require('os');

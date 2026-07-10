@@ -1,11 +1,14 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: Apache-2.0
 // Claudium plugin — SessionEnd hook. Builds the privacy-scrubbed usage record
-// for the session that just finished and POSTs it to Claudium Cloud; with the
-// local transcripts opt-in, also uploads secret/PII-redacted turns.
+// for the session that just finished and POSTs it to Claudium Cloud. Raw
+// transcripts never leave the machine — unconditionally: there is no
+// transcript upload path at all (D1b/Task 17).
 //
 // CONTRACT: this process must NEVER disturb the user's session — every path
 // exits 0; failures go to stderr only. Config: ~/.claudium/plugin.json
-// { "url": "https://…", "token": "…", "transcripts": false }
+// { "url": "https://…", "token": "…" }
+// (a stale "transcripts" key from an older config is silently ignored.)
 //
 // Self-contained: requires ONLY ./lib (vendored by scripts/build-plugin.js)
 // and Node built-ins. No npm install.
@@ -13,29 +16,90 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawn } = require('child_process');
 const { sessionize } = require('./lib/sessionize');
 const { computeMetrics } = require('./lib/metrics');
-const { extractAbstraction } = require('./lib/extract');
+const { fallbackAbstraction } = require('./lib/extract');
 const { buildRecord } = require('./lib/record');
-const { buildTranscriptTurns } = require('./lib/transcript');
 const { getProjectName } = require('./lib/parse');
+const { loadSalt } = require('./lib/anonymize');
+const { lastClassifyCost } = require('./lib/coach-ledger');
+// D4 (final review, item 1b): backfillAll's walk descends into EVERY project
+// dir under CLAUDE_DIR, including one derived from the classify() child's
+// own cwd (~/.claudium/classify) — buildFor must skip it explicitly, the
+// same way it skips subagent sidecars below. Shared (not duplicated)
+// predicate — see lib/classify-path.js.
+const { isClassifyProjectPath } = require('./lib/classify-path');
+// Task 24 (G3): named sharing tiers, one config surface — resolveTier is the
+// SAME resolver the sender pipeline uses (lib/sharing-tiers.js, vendored
+// here by scripts/build-plugin.js), so both routes read one `tier` key off
+// the SAME plugin.json (loadConfig, below) and the SAME CLAUDIUM_TIER/legacy
+// env precedence.
+const { resolveTier, describeTier, TIERS } = require('./lib/sharing-tiers');
+
+// Task 14 item 1: plugin/enrich-session.js is the fully detached
+// classification child — a real separate node process, spawned by
+// spawnEnrich below, requiring only ./lib (vendored) so it's vendor-safe
+// exactly like this file.
+const ENRICH_SCRIPT = path.join(__dirname, 'enrich-session.js');
 
 const CONFIG_PATH = path.join(os.homedir(), '.claudium', 'plugin.json');
 const CLAUDE_DIR = process.env.CLAUDE_DIR || path.join(os.homedir(), '.claude', 'projects');
 const MARKER_PATH = path.join(path.dirname(CONFIG_PATH), 'backfilled');
+// A1: same directory as plugin.json/backfilled — this is where the
+// per-machine HMAC salt (lib/anonymize.js's loadSalt) lives too.
+const CLAUDIUM_DIR = path.dirname(CONFIG_PATH);
 
+// Task 15 item 2: this is the ONE place the plugin route reads plugin.json —
+// every config-derived value below (classify gate, project label overrides,
+// the optional apiKey auth override) comes from this single parse. There is
+// deliberately NO model-choice field anywhere in this config: the pinned
+// model (lib/classify-headless.js's MODEL, 'claude-haiku-4-5') is what makes
+// cross-org labels comparable — a per-user model knob would break that.
 function loadConfig(p = CONFIG_PATH) {
   try {
     const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
     if (!cfg || typeof cfg.url !== 'string' || typeof cfg.token !== 'string') return null;
-    return { url: cfg.url, token: cfg.token, transcripts: cfg.transcripts === true };
+    const projectLabels = (cfg.project_labels && typeof cfg.project_labels === 'object') ? cfg.project_labels : {};
+    // Task 14 item 5: classify() enrichment is on by default; only an
+    // explicit "off" opts out.
+    const classify = cfg.classify === 'off' ? 'off' : 'on';
+    // Task 15 item 2: optional auth override — feeds classify()'s auth-ladder
+    // apiKey rung ahead of any ambient ANTHROPIC_API_KEY (see spawnEnrich,
+    // which threads this through to the detached enrichment child).
+    const apiKey = typeof cfg.anthropic_api_key === 'string' ? cfg.anthropic_api_key : '';
+    // D1b (Task 17): the transcript upload path is gone. A stale
+    // "transcripts" key from an older config is simply never read here —
+    // tolerated silently, never an error.
+    // Task 24 (G3): resolve the named sharing tier from THIS SAME parsed
+    // plugin.json (a `tier` key) plus process.env (CLAUDIUM_TIER, and the
+    // legacy BRAIN_SHARING/BRAIN_USAGE envs, mapped conservatively — see
+    // lib/sharing-tiers.js's resolveTier for the full precedence/mapping).
+    const { tier, flags, legacyWarning } = resolveTier(cfg, process.env);
+    return { url: cfg.url, token: cfg.token, projectLabels, classify, apiKey, tier, flags, legacyWarning };
   } catch { return null; }
 }
 
 const isSubagentPath = p => /[/\\]subagents[/\\]/.test(String(p || ''));
 
-async function buildFor(filepath, claudeDir, { apiKey } = {}) {
+// Task 14 (C5): this build is ALWAYS deterministic — no network call, no
+// added latency, so the SessionEnd hook can POST and exit 0 instantly. The
+// richer classify() auth ladder (API key -> headless `claude -p` ->
+// deterministic) runs ONLY in the detached enrichment child spawned by
+// uploadAndEnrich below. Since backfill (backfillAll's walk AND
+// maybeAutoBackfill) calls uploadOne -> buildFor directly and NEVER
+// uploadAndEnrich, backfill never classifies, by construction.
+// shipFacts (Task 24/G3, default true — see lib/sharing-tiers.js): tier
+// 'metrics' forces session_facts to [] on the record this produces, even
+// though this build is always deterministic (fallbackAbstraction never sets
+// .facts) — threaded through here for parity with the sender pipeline's
+// buildRecordForFile, and because the ENRICHED rebuild (plugin/enrich-session.js,
+// where classify() actually runs) is a separate process that reads the same
+// flag across its own env-var boundary (see spawnEnrich's
+// CLAUDIUM_ENRICH_SHIP_FACTS below).
+async function buildFor(filepath, claudeDir, { projectLabels, claudiumDir = CLAUDIUM_DIR, shipFacts = true } = {}) {
   if (isSubagentPath(filepath)) return null;
+  if (isClassifyProjectPath(filepath)) return null;   // never ingest the classify() child's own transcript
   const raw = await fs.promises.readFile(filepath, 'utf8');
   const lines = raw.split('\n').filter(l => l.trim());
   if (!lines.length) return null;
@@ -45,10 +109,15 @@ async function buildFor(filepath, claudeDir, { apiKey } = {}) {
   });
   if (!session.turnCount) return null;
   const metrics = computeMetrics(session);
-  const abstraction = await extractAbstraction(session, { apiKey: apiKey || process.env.ANTHROPIC_API_KEY || '' });
+  const abstraction = fallbackAbstraction(session);
+  // Ledger read follows the same claudiumDir as the salt below (the real
+  // CLAUDIUM_DIR on the shipping path; tests pass a temp dir).
   let coachNudges = [];
-  try { coachNudges = require('./lib/coach-ledger').nudgesFor(session.claudeSessionId); } catch {}
-  return { record: buildRecord({ session, metrics, abstraction, coachNudges }), session };
+  try { coachNudges = require('./lib/coach-ledger').nudgesFor(session.claudeSessionId, { dir: claudiumDir }); } catch {}
+  // A1: this is a SHIPPED path — always pseudonymize project_label
+  // (per-machine salt, created on demand; user-assigned overrides win).
+  const salt = loadSalt(claudiumDir);
+  return { record: buildRecord({ session, metrics, abstraction, coachNudges, salt, projectLabels, shipFacts }), session };
 }
 
 async function post(base, apiPath, token, body, fetchImpl) {
@@ -59,23 +128,93 @@ async function post(base, apiPath, token, body, fetchImpl) {
   });
 }
 
+// Task 24 (G3): the usage flag gates record shipping — this is the ONE
+// choke point every plugin-route caller funnels through (runHook's
+// uploadAndEnrich, backfillAll, maybeAutoBackfill, runBackfill), so tier
+// 'off'/'presence'/'activity' (usage: false) never ships a usage record
+// from ANY of them, uniformly. A cfg with no .flags at all (a caller that
+// built cfg directly rather than through loadConfig — this repo's own
+// spawn/detach unit tests do exactly that) falls back to TIERS.full
+// (today's default), never silently dropping an older caller's uploads.
+function effectiveFlags(cfg) {
+  return (cfg && cfg.flags) || TIERS.full;
+}
+
 async function uploadOne(filepath, claudeDir, cfg, fetchImpl = globalThis.fetch) {
+  const flags = effectiveFlags(cfg);
+  if (!flags.usage) return 'skip';
   try {
-    const built = await buildFor(filepath, claudeDir, {});
+    const built = await buildFor(filepath, claudeDir,
+      { projectLabels: cfg.projectLabels, claudiumDir: cfg.claudiumDir, shipFacts: flags.facts });
     if (!built) return 'skip';
     const base = String(cfg.url).replace(/\/+$/, '');
     const r = await post(base, '/api/records', cfg.token, built.record, fetchImpl);
     if (!r || !r.ok) { console.error(`claudium: record not stored (${r && r.status})`); return false; }
-    if (cfg.transcripts) {
-      const turns = buildTranscriptTurns(built.session);
-      if (turns.length) {
-        const t = await post(base, '/api/transcripts', cfg.token,
-          { claude_session_id: built.record.claude_session_id, turns }, fetchImpl);
-        if (!t || !t.ok) console.error(`claudium: transcript not stored (${t && t.status})`);
-      }
-    }
     return true;
   } catch (e) { console.error(`claudium: upload failed: ${e.message}`); return false; }
+}
+
+// Task 14 item 1: spawns lib/classify-headless.js's classify() ladder in a
+// FULLY DETACHED child process (plugin/enrich-session.js) so the SessionEnd
+// hook never waits on an LLM call to exit. detached + stdio: 'ignore' +
+// unref() together mean this process can exit the instant spawnImpl
+// returns: the child is never attached to it, and re-POSTs the enriched
+// record entirely on its own, after this process is already gone (see
+// enrich-session.js's own file header for that side of the contract).
+//
+// Config/state cross the process boundary via env vars only (stdio is
+// ignored, so no pipe is available) — CLAUDIUM_ENRICH_* below is the whole
+// contract; plugin/enrich-session.js's optsFromEnv reads the same names.
+//
+// Recursion note: this is reachable ONLY from within runHook, which has
+// already returned early if CLAUDIUM_CLASSIFYING is set on ITS OWN env (see
+// runHook below) — so this never fires from inside a classify child's own
+// SessionEnd. The env passed to the CHILD here is never given
+// CLAUDIUM_CLASSIFYING itself; only classifyHeadless()'s OWN spawned
+// `claude -p` (a grandchild, deep inside the enrichment child) gets that.
+function spawnEnrich(fp, claudeDir, cfg, { spawnImpl = spawn } = {}) {
+  try {
+    const child = spawnImpl(process.execPath, [ENRICH_SCRIPT], {
+      cwd: __dirname,
+      detached: true,
+      stdio: 'ignore',
+      env: Object.assign({}, process.env, {
+        CLAUDIUM_ENRICH_FILE: fp,
+        CLAUDIUM_ENRICH_CLAUDE_DIR: claudeDir,
+        CLAUDIUM_ENRICH_URL: cfg.url,
+        CLAUDIUM_ENRICH_TOKEN: cfg.token,
+        CLAUDIUM_ENRICH_CLAUDIUM_DIR: cfg.claudiumDir || CLAUDIUM_DIR,
+        CLAUDIUM_ENRICH_PROJECT_LABELS: JSON.stringify(cfg.projectLabels || {}),
+        // Task 15 item 2: the optional plugin.json auth override, threaded
+        // across the process boundary the same way every other cfg field is
+        // (stdio is 'ignore' — env vars are the whole contract). Empty
+        // string, never undefined, when no override is configured.
+        CLAUDIUM_ENRICH_API_KEY: cfg.apiKey || '',
+        // Task 24 (G3): the resolved tier's `facts` flag, threaded the same
+        // way — '0' forces the enriched re-POST's session_facts to []
+        // (tier 'metrics'); '1' (the default, matching TIERS.full) ships
+        // them. A cfg with no .flags at all (direct-construction callers)
+        // defaults to '1', same backward-compatible fallback as uploadOne's
+        // effectiveFlags.
+        CLAUDIUM_ENRICH_SHIP_FACTS: effectiveFlags(cfg).facts ? '1' : '0',
+      }),
+    });
+    if (child && typeof child.unref === 'function') child.unref();
+    return child;
+  } catch (e) {
+    console.error(`claudium: enrich spawn failed: ${e.message}`);
+    return null;
+  }
+}
+
+// uploadOne, then (only if it stored AND classify isn't turned off)
+// spawnEnrich. This is the ONLY caller of spawnEnrich in this file —
+// backfillAll/maybeAutoBackfill (below) call uploadOne directly, so backfill
+// never enriches/classifies.
+async function uploadAndEnrich(fp, claudeDir, cfg, { fetchImpl = globalThis.fetch, spawnImpl = spawn } = {}) {
+  const stored = await uploadOne(fp, claudeDir, cfg, fetchImpl);
+  if (stored === true && cfg.classify !== 'off') spawnEnrich(fp, claudeDir, cfg, { spawnImpl });
+  return stored;
 }
 
 function readStdinJson() {
@@ -87,12 +226,30 @@ function readStdinJson() {
   });
 }
 
-async function runHook() {
+async function runHook(opts = {}) {
+  // D4 recursion guard: lib/classify-headless.js spawns `claude -p` as a
+  // child with CLAUDIUM_CLASSIFYING=1 in its env (inherited down that
+  // child's whole process tree). If THIS SessionEnd hook fires again for
+  // that child's own session, bail out immediately — never sessionize or
+  // classify the classifier's own transcript, or the recursion never ends.
+  // This also means uploadAndEnrich/spawnEnrich below are NEVER reached from
+  // inside a classify child's own SessionEnd — the guard is upstream of them.
+  if (process.env.CLAUDIUM_CLASSIFYING) return;
   const cfg = loadConfig();
   if (!cfg) { console.error('claudium: no config — run the connect setup from /connect first'); return; }
+  // Task 24 (G3): a legacy BRAIN_SHARING/BRAIN_USAGE env resolved the tier
+  // conservatively rather than an explicit tier/CLAUDIUM_TIER — warn once.
+  // Each SessionEnd hook invocation is itself a fresh, short-lived process,
+  // so printing here satisfies "once per boot" the same way the sender
+  // daemon's single boot-time print does.
+  if (cfg.legacyWarning) console.error(`claudium: ${cfg.legacyWarning}`);
   const input = await readStdinJson();
   const fp = input && input.transcript_path;
-  if (fp) await uploadOne(fp, CLAUDE_DIR, cfg);
+  // Task 14 item 1: POST immediately with deterministic labels (uploadOne,
+  // inside uploadAndEnrich), then — only if that landed and classify isn't
+  // turned off — spawn the fully detached enrichment child. Either way this
+  // hook exits 0 right after, never having waited on an LLM.
+  if (fp) await uploadAndEnrich(fp, CLAUDE_DIR, cfg, opts);
   else console.error('claudium: hook input had no transcript_path');
   try { await maybeAutoBackfill(cfg); }
   catch (e) { console.error(`claudium: auto-backfill: ${e.message}`); }
@@ -117,21 +274,94 @@ async function backfillAll(cfg, claudeDir = CLAUDE_DIR, fetchImpl = globalThis.f
   return { attempted, stored };
 }
 
-// First-run auto-import: the marker makes this once-ever; a total failure
-// writes no marker so the next session end retries (uploads are idempotent).
-async function maybeAutoBackfill(cfg, { markerFile = MARKER_PATH, claudeDir = CLAUDE_DIR, fetchImpl = globalThis.fetch } = {}) {
+// Task 25 (G4): first-run history import is CONSENTED to, never silent.
+// SessionEnd used to auto-import history in the background the first time it
+// ran (see git history for that version) — that's gone. maybeAutoBackfill
+// now NEVER imports anything; it only ever writes a one-time
+// "backfill-notice" marker (a sibling of MARKER_PATH, same directory) and
+// prints a best-effort stderr line, so the pending state doesn't get
+// re-announced every single session end. The actual import only ever
+// happens through the explicit /claudium:backfill command (runBackfill,
+// below), which is the ONE place any history now leaves the machine
+// unprompted-by-a-live-session (still gated by uploadOne's normal record
+// build, still deterministic-only — see buildFor's own header comment).
+//
+// SessionEnd hook output is a dead end for user-facing notices: per Claude
+// Code's hooks reference, SessionEnd has no decision control (it cannot
+// block or affect session behavior), stdout on exit 0 is never shown to the
+// user, and the only output that surfaces at all is stderr's first line on
+// a NON-ZERO exit — which this hook never uses (the file-header CONTRACT:
+// every path exits 0, so nothing ever surfaces in-session). So the stderr
+// line below is best-effort only (visible to someone tailing logs, never to
+// the user in-session) — the notice that actually reaches the user is
+// /claudium:status's "history import: pending — run /claudium:backfill"
+// line (runStatus, below), which is why the notice marker's ONLY job is
+// de-duplicating this function's own side effects across repeated
+// SessionEnd invocations, not the user-visible state itself (that's just
+// "does MARKER_PATH exist").
+//
+// Task 24 (G3): a tier with usage:false must not get nagged to run a command
+// that can't do anything at that tier, AND must not permanently foreclose
+// the pending notice — mirrors the same guard the old auto-import used, bail
+// BEFORE touching either marker so the notice still surfaces the moment the
+// tier allows usage records.
+async function maybeAutoBackfill(cfg, {
+  markerFile = MARKER_PATH,
+  // Defaults to a sibling of markerFile — this means every existing caller
+  // that already overrides markerFile alone (this file's own tests, and
+  // plugin-enrich-gate.test.js) automatically gets a hermetic noticeFile too,
+  // with no risk of ever touching the real ~/.claudium/backfill-notice.
+  noticeFile = path.join(path.dirname(markerFile), 'backfill-notice'),
+} = {}) {
+  if (!effectiveFlags(cfg).usage) return false;
   if (fs.existsSync(markerFile)) return false;
-  const { attempted, stored } = await backfillAll(cfg, claudeDir, fetchImpl);
-  if (attempted > 0 && stored === 0) return false;
-  fs.writeFileSync(markerFile, JSON.stringify({ at: new Date().toISOString() }) + '\n');
+  if (fs.existsSync(noticeFile)) return false;
+  console.error('claudium: history import is pending — run /claudium:backfill to import your existing session history, or /claudium:backfill --skip to dismiss this notice');
+  try { fs.writeFileSync(noticeFile, JSON.stringify({ at: new Date().toISOString() }) + '\n'); } catch {}
   return true;
 }
 
-async function runBackfill() {
-  const cfg = loadConfig();
-  if (!cfg) { console.error('claudium: no config — run the connect setup from /connect first'); return; }
-  await backfillAll(cfg, CLAUDE_DIR, globalThis.fetch);
-  try { fs.writeFileSync(MARKER_PATH, JSON.stringify({ at: new Date().toISOString() }) + '\n'); } catch {}
+// /claudium:backfill — the explicit, consensual counterpart to the notice
+// above. Mirrors runStatus's injectable configPath/markerFile/claudeDir/
+// fetchImpl pattern so tests never touch the real ~/.claudium or network.
+// `skip` (the command's `--skip` flag) records an explicit decline WITHOUT
+// importing anything — it writes the SAME marker file maybeAutoBackfill and
+// this function both check, so declining stops the notice for good, exactly
+// like a real import would; skip always succeeds regardless of tier, since
+// declining doesn't ship anything at any tier.
+async function runBackfill({
+  configPath = CONFIG_PATH,
+  markerFile = MARKER_PATH,
+  claudeDir = CLAUDE_DIR,
+  fetchImpl = globalThis.fetch,
+  skip = false,
+} = {}) {
+  const cfg = loadConfig(configPath);
+  if (!cfg) { console.log('config: missing — set up at your dashboard’s /connect page'); return; }
+
+  if (skip) {
+    fs.writeFileSync(markerFile, JSON.stringify({ at: new Date().toISOString(), skipped: true }) + '\n');
+    console.log('history import: skipped by user — nothing imported; run /claudium:backfill any time to import later');
+    return;
+  }
+
+  // Task 24 (G3): same guard as maybeAutoBackfill — a non-shipping tier
+  // makes every uploadOne call inside backfillAll's walk return 'skip',
+  // which backfillAll doesn't count as "attempted" at all, indistinguishable
+  // from genuinely empty history. Bail BEFORE walking so no marker gets
+  // written, and say so, rather than silently doing nothing.
+  if (!effectiveFlags(cfg).usage) {
+    console.log(`history import: skipped by tier "${cfg.tier}" — ${describeTier(cfg.tier)}; nothing imported, no marker written`);
+    return;
+  }
+
+  const { attempted, stored } = await backfillAll(cfg, claudeDir, fetchImpl);
+  if (attempted > 0 && stored === 0) {
+    console.log(`history import: failed — 0 of ${attempted} sessions stored; nothing marked done, try again later`);
+    return;
+  }
+  fs.writeFileSync(markerFile, JSON.stringify({ at: new Date().toISOString(), imported: stored }) + '\n');
+  console.log(`history import: done — ${stored} session${stored === 1 ? '' : 's'} imported`);
 }
 
 function classifyProbe(res) {
@@ -140,16 +370,50 @@ function classifyProbe(res) {
   return 'connected';
 }
 
-// /claudium:status — three lines, never prints the token, always exits 0.
-async function runStatus(fetchImpl = globalThis.fetch) {
-  const cfg = loadConfig();
+// Task 15 item 3: classification mode, in the SAME priority order
+// classify()'s auth ladder itself uses (lib/classify-headless.js) — off
+// beats everything (nothing runs at all); an explicit apiKey override beats
+// the default headless tier.
+function classificationMode(cfg) {
+  if (cfg.classify === 'off') return 'off';
+  if (cfg.apiKey) return 'on (api-key override)';
+  return 'on (headless — your Claude Code login)';
+}
+
+// /claudium:status — never prints the token, always exits 0. configPath/
+// markerPath/claudiumDir are injectable (mirrors loadConfig's own `p` param)
+// so tests can point this at a throwaway dir instead of the real ~/.claudium.
+async function runStatus(fetchImpl = globalThis.fetch, { configPath = CONFIG_PATH, markerPath = MARKER_PATH, claudiumDir = CLAUDIUM_DIR } = {}) {
+  const cfg = loadConfig(configPath);
   if (!cfg) { console.log('config: missing — set up at your dashboard’s /connect page'); return; }
-  console.log(`config: ${cfg.url} · token set · transcripts ${cfg.transcripts ? 'on' : 'off'}`);
+  console.log(`config: ${cfg.url} · token set`);
+  // Task 25 (G4): three states off the SAME marker file runBackfill (the
+  // /claudium:backfill command) and maybeAutoBackfill's notice both read —
+  // no marker at all means the import is still pending (a plain "backfilled"
+  // marker with skipped:true means the user explicitly declined, above the
+  // marker.at check so a skip never reads as "done").
   let marker = null;
-  try { marker = JSON.parse(fs.readFileSync(MARKER_PATH, 'utf8')); } catch {}
-  console.log(marker && marker.at
-    ? `history import: done ${marker.at}`
-    : 'history import: pending — runs automatically after your next session ends');
+  try { marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')); } catch {}
+  console.log(marker && marker.skipped ? `history import: skipped by user (${marker.at})`
+    : marker && marker.at ? `history import: done (${marker.at})`
+    : 'history import: pending — run /claudium:backfill');
+  console.log(`classification: ${classificationMode(cfg)}`);
+  // Task 24 (G3): the resolved sharing tier + its one-line meaning — the
+  // SAME tier lib/sharing-tiers.js's resolveTier computed inside loadConfig
+  // above (CLAUDIUM_TIER > plugin.json "tier" > legacy env, conservatively >
+  // default 'full'). If a legacy env resolved it, surface that too, so
+  // status doubles as the "boot warning" surface for a one-off status check.
+  console.log(`sharing tier: ${cfg.tier} — ${describeTier(cfg.tier)}`);
+  if (cfg.legacyWarning) console.log(`note: ${cfg.legacyWarning}`);
+  // Task 15 item 1/3: the coach ledger's last classify_cost entry — logged by
+  // both capture routes (plugin/enrich-session.js, lib/usage-pipeline.js)
+  // after every successful non-deterministic classification. Best-effort: a
+  // ledger read failure must never break /claudium:status.
+  let last = null;
+  try { last = lastClassifyCost({ dir: claudiumDir }); } catch { /* status must always report something */ }
+  console.log(last
+    ? `last classification: ${last.activity_category || 'unknown'} · ${last.domain || 'unknown'} · $${Number(last.cost_usd || 0).toFixed(6)} (${last.classifier || 'unknown'})`
+    : 'last classification: none yet');
   let res;
   try {
     const r = await post(String(cfg.url).replace(/\/+$/, ''), '/api/records', cfg.token, {}, fetchImpl);
@@ -158,11 +422,14 @@ async function runStatus(fetchImpl = globalThis.fetch) {
   console.log(`server: ${classifyProbe(res)}`);
 }
 
-module.exports = { loadConfig, buildFor, uploadOne, runHook, runBackfill,
+module.exports = { loadConfig, buildFor, uploadOne, uploadAndEnrich, spawnEnrich, runHook, runBackfill,
   backfillAll, maybeAutoBackfill, runStatus, classifyProbe, CONFIG_PATH, MARKER_PATH };
 
 if (require.main === module) {
-  const main = process.argv.includes('--backfill') ? runBackfill
+  // Task 25 (G4): --skip travels alongside --backfill (the /claudium:backfill
+  // command's `$ARGUMENTS` pass-through — see plugin/commands/backfill.md) —
+  // e.g. `/claudium:backfill --skip` runs this file with both flags present.
+  const main = process.argv.includes('--backfill') ? () => runBackfill({ skip: process.argv.includes('--skip') })
     : process.argv.includes('--status') ? runStatus : runHook;
   main().then(() => process.exit(0)).catch(e => { console.error(`claudium: ${e.message}`); process.exit(0); });
 }

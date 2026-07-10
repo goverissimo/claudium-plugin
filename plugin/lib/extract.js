@@ -1,18 +1,53 @@
+// SPDX-License-Identifier: Apache-2.0
 // lib/extract.js — Tier-1 abstraction. Runs SENDER-SIDE using the
 // contributor's OWN ANTHROPIC_API_KEY. The raw transcript is the model's
 // input (locally, on the user's machine) but never its output: the model is
-// forced to emit only an enum category/domain + a generic intent phrase, and
-// that output is still scrubbed by lib/scrub.js before anything is shipped.
+// forced to emit only an enum category/domain + a generic intent phrase.
+//
+// A3: only activity_category/domain ever ship — intent_summary ships as a
+// machine-composed template of those two enums (lib/scrub.js), never free
+// text. The model's own generic intent phrase stays on this object as
+// `local_intent`, for LOCAL use only (coach/report); it is never sent to the
+// hub and lib/record.js's buildRecord never reads it.
 //
 // With no API key it degrades to a deterministic guess from the tool mix —
 // no LLM, no intent text — so the pipeline always produces a record.
 
-const { ACTIVITY_CATEGORIES, DOMAINS } = require('./scrub');
+const { ACTIVITY_CATEGORIES, DOMAINS, BUILTIN_TOOLS, scrubText, FACT_KEYS } = require('./scrub');
+
+// Task 14 (fold-forward from Task 13's review): same allowlist discipline as
+// lib/classify-headless.js's buildClassifyDigest — ONLY names in scrub's
+// fixed BUILTIN_TOOLS enum pass through verbatim. Any other tool name can
+// embed a customer's internal server/integration/product name just as
+// easily as an MCP name can ('mcp__acme-internal-crm__lookup_customer', but
+// equally a custom local 'internal_deploy_to_acme_prod') — never let a
+// non-builtin name reach condense()'s output, which IS the model's entire
+// input for the haiku_api tier and leaves the machine over the network.
+const BUILTIN_TOOL_SET = new Set(BUILTIN_TOOLS);
+function generalizeToolName(name) {
+  if (typeof name !== 'string' || !name) return 'other';
+  return name.startsWith('mcp__') ? 'mcp' : (BUILTIN_TOOL_SET.has(name) ? name : 'other');
+}
+
+// A7/D2: pinned classification-model version stamp. This is NOT the
+// Anthropic API `model` string used in the request body below (that's
+// whichever model id the caller passes/defaults) — it's a versioned
+// identifier for THIS extractor module/prompt, so the hub can tell which
+// classification logic produced a record even as the underlying model or
+// prompt changes ('.p1' = prompt/logic revision 1). Bump this deliberately
+// when the extraction approach changes.
+const EXTRACTOR_VERSION = 'claude-haiku-4-5.p1';
 
 function condense(session) {
-  const toolSeq = (session.toolCalls || []).map(t => t.name).slice(0, 60).join(', ');
-  const firstUser = (session.firstUserText || '').slice(0, 600);
-  const asstHead = (session.assistantText || '').slice(0, 600);
+  // Fold-forward (Task 14): tool names go through the SAME allowlist as
+  // buildClassifyDigest (generalizeToolName, above); prompt/assistant text
+  // is scrubbed BEFORE truncating — scrub-then-truncate order, never the
+  // reverse: truncate-first can cut a secret mid-token at the boundary,
+  // leaving a prefix too short for the secret patterns to match, which
+  // would then ship unredacted.
+  const toolSeq = (session.toolCalls || []).map(t => generalizeToolName(t && t.name)).slice(0, 60).join(', ');
+  const firstUser = scrubText(String(session.firstUserText || '')).slice(0, 600);
+  const asstHead = scrubText(String(session.assistantText || '')).slice(0, 600);
   return [
     `Tools used (in order): ${toolSeq || 'none'}`,
     `Turn count: ${session.turnCount}`,
@@ -65,7 +100,12 @@ function fallbackAbstraction(session) {
     else if (has('Bash')) cat = 'devops_deploy';
     else cat = 'other';
   }
-  return { activity_category: cat, domain: domainFromFiles(session), intent_summary: '', model: '' };
+  // A7/D2: no LLM ran here — stamp the fail-closed classifier so the shipped
+  // record never LOOKS like a model classified it when one didn't.
+  return {
+    activity_category: cat, domain: domainFromFiles(session), local_intent: '', model: '',
+    classifier: 'deterministic', extractor_version: EXTRACTOR_VERSION,
+  };
 }
 
 async function extractAbstraction(session, opts = {}) {
@@ -83,6 +123,29 @@ async function extractAbstraction(session, opts = {}) {
         intent_summary: {
           type: 'string',
           description: 'One neutral phrase (<=120 chars) describing the GENERIC task. NO proper nouns, company/product names, file contents, code, paths, secrets, URLs, or PII. Generalize when unsure.',
+        },
+        // D1a (Task 16): the SAME tool call also returns reduce-grade session
+        // facts — mirrors lib/classify-headless.js's `facts` extension so the
+        // two non-deterministic classify() rungs stay symmetric. Optional: a
+        // model that omits it (or the property entirely) still classifies
+        // fine — extractAbstraction below defaults to [] either way.
+        facts: {
+          type: 'array',
+          // Review fix (ATOMIC cloud-facts, Important): same canonical-verdict
+          // opening-token instruction as lib/classify-headless.js's
+          // buildPrompt — db.factsAggregates buckets by the verdict's
+          // complete first word (lib/db.js's VERDICT_WIN_RE/VERDICT_LOSS_RE),
+          // and the two non-deterministic classify() rungs must stay
+          // symmetric.
+          description: 'At most one entry per key, only for keys the session actually gives evidence for. For k="verdict", v MUST begin with exactly one of the words "win", "partial", or "loss" — optionally followed by " — " and a short qualifier (for example "win — but rushed").',
+          items: {
+            type: 'object',
+            properties: {
+              k: { type: 'string', enum: FACT_KEYS },
+              v: { description: 'A short string (<=120 chars, no proper nouns/paths/code/secrets/PII) or a number.' },
+            },
+            required: ['k', 'v'],
+          },
         },
       },
       required: ['activity_category', 'domain', 'intent_summary'],
@@ -113,8 +176,17 @@ async function extractAbstraction(session, opts = {}) {
     return {
       activity_category: block.input.activity_category,
       domain: block.input.domain,
-      intent_summary: block.input.intent_summary || '',
+      // A3: local-only — see the file-header comment. Never shipped.
+      local_intent: block.input.intent_summary || '',
       model,
+      // A7/D2: the live API path ran successfully — stamp provenance.
+      classifier: 'haiku_api',
+      extractor_version: EXTRACTOR_VERSION,
+      // D1a (Task 16): bare pass-through, same reasoning as
+      // lib/classify-headless.js's parseHeadlessOutput — lib/scrub.js's
+      // session_facts field (via lib/record.js's buildRecord) is the actual
+      // gate; this module never re-implements that filtering.
+      facts: Array.isArray(block.input.facts) ? block.input.facts : [],
     };
   } catch {
     return fallbackAbstraction(session);
@@ -123,4 +195,4 @@ async function extractAbstraction(session, opts = {}) {
   }
 }
 
-module.exports = { extractAbstraction, fallbackAbstraction, condense, domainFromFiles };
+module.exports = { extractAbstraction, fallbackAbstraction, condense, domainFromFiles, EXTRACTOR_VERSION };

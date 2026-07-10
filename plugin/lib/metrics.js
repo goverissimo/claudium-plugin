@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // lib/metrics.js — Tier-0 deterministic metrics from a Session. Pure.
 //
 // Everything here is derived from transcript STRUCTURE (counts, errors,
@@ -171,6 +172,8 @@ function computeMetrics(session) {
   const shipped = commits > 0 || !!session.pushed;
   const editResults = session.editResults || 0;
   const userEditRate = editResults > 0 ? clamp01((session.userModifiedEdits || 0) / editResults) : 0;
+  const interruptions = session.interruptions || 0;
+  const satisfaction = detectSatisfaction(session, frustration);
 
   let score = 0.5;
   if (testsPassed && !testsFailed) score += 0.20;
@@ -184,10 +187,23 @@ function computeMetrics(session) {
   score -= 0.10 * frustration.score;          // the human was fighting the tool
   score = clamp01(score);
 
+  // 'partial' must mean genuinely MIXED evidence, not the absence of any
+  // evidence. With none of the signals below, score sits at its neutral
+  // base (0.5, or 0.6 with only endsWithSummary) purely by construction —
+  // that band is a fallthrough, not a verdict. Route it to 'unknown'
+  // instead so 'partial' stays meaningful. (endsWithSummary/shipped-via-
+  // score-boost-only cases aside, every real deduction/boost above is tied
+  // to one of these signals, so 'failed'/'success' can never be reached
+  // with hasEvidence === false.)
+  const hasEvidence = errorResults > 0 || testsPassed || testsFailed
+    || rework > 0 || shipped || userEditRate > 0
+    || denials > 0 || interruptions > 0 || frustration.score > 0
+    || satisfaction === 'positive' || satisfaction === 'negative';
+
   let outcome;
   if (abandoned) outcome = 'abandoned';
   else if (score < 0.45) outcome = 'failed';
-  else if (score < 0.75) outcome = 'partial';
+  else if (score < 0.75) outcome = hasEvidence ? 'partial' : 'unknown';
   else outcome = 'success';
 
   const frictionScore = clamp01(
@@ -219,10 +235,10 @@ function computeMetrics(session) {
     outcome,
     outcomeScore: round3(score),
     frictionReasons: frictionReasons(session, { errorResults, errFactor, testsFailed, rework, outcome, frustration }),
-    satisfaction: detectSatisfaction(session, frustration),
+    satisfaction,
     denials,
     denialRate: round3(denialRate),
-    interruptions: session.interruptions || 0,
+    interruptions,
     frustrationScore: frustration.score,
     cacheHitRatio: round3(cacheHitRatio),
     estCostUsd,

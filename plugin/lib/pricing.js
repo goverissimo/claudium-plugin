@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // lib/pricing.js — rough USD cost estimate from token counts. Pure.
 //
 // List prices change over time and vary by tier — treat this as an ESTIMATE,

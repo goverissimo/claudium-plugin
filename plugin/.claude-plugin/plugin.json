@@ -1,6 +1,7 @@
 {
   "name": "claudium",
-  "description": "Uploads privacy-scrubbed Claude Code usage records (and opt-in redacted transcripts) to your team's Claudium dashboard when a session ends.",
-  "version": "1.1.0",
-  "author": { "name": "Claudium" }
+  "description": "Uploads privacy-scrubbed Claude Code usage records to your team's Claudium dashboard when a session ends. Raw transcripts never leave your machine.",
+  "version": "1.3.0",
+  "author": { "name": "Claudium" },
+  "license": "Apache-2.0"
 }
