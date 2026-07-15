@@ -5,19 +5,21 @@
 // tool names and subagent types in a later pass) never leave this machine —
 // only a stable, one-way hash of them does. The salt that makes the hash
 // unforgeable ALSO never leaves this machine: it lives in a single file,
-// `<dir>/salt` (default ~/.claudium/salt), created once with
+// `<dir>/salt` (default ~/.tokenomica/salt, or the adopted ~/.claudium of a
+// pre-rename install — see lib/config-dir.js), created once with
 // crypto.randomBytes and mode 0600, then reused forever. Same name + same
 // machine salt => same hash every time (so downstream grouping/threading
 // still works on the pseudonym) — but nobody without the salt can recover
 // the raw name from the hash.
 //
-// Pure except for loadSalt, the one fs-touching helper here. Dependency-free
-// (Node builtins only) so this file can be vendored into the plugin as-is.
+// Pure except for loadSalt, the one fs-touching helper here. Only Node
+// builtins plus the sibling ./config-dir (also vendored into the plugin, see
+// scripts/build-plugin.js), so this file can be vendored as-is.
 
 const crypto = require('crypto');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
+const { configDir } = require('./config-dir');
 
 // hmac12(salt, value) -> first 12 lowercase hex chars of an HMAC-SHA256 of
 // value, keyed by salt. 12 hex chars (48 bits) is plenty to dedupe/group
@@ -31,7 +33,7 @@ function hmac12(salt, value) {
     .toLowerCase();
 }
 
-// loadSalt(dir = ~/.claudium) -> the per-machine salt, creating it on first
+// loadSalt(dir = configDir()) -> the per-machine salt, creating it on first
 // use (32 random bytes -> 64 hex chars, file mode 0600). Never regenerated
 // once a usable value is written, so hashes of the same raw name stay
 // stable across runs. Creation is race-safe: the write uses the exclusive
@@ -46,7 +48,7 @@ function hmac12(salt, value) {
 // first create) holds no salt worth preserving, so it is REPAIRED with a
 // fresh salt via a plain clobbering write — loadSalt never returns a
 // falsy/whitespace value.
-function loadSalt(dir = path.join(os.homedir(), '.claudium')) {
+function loadSalt(dir = configDir()) {
   const file = path.join(dir, 'salt');
   try {
     const existing = fs.readFileSync(file, 'utf8').trim();

@@ -16,13 +16,13 @@
 // session. If SessionEnd hooks are configured for this user, ending that
 // child session would fire the SAME hook that got us here — spawning another
 // child, forever. Two independent guards close this off:
-//   1. The child always inherits CLAUDIUM_CLASSIFYING=1 in its env (env vars
+//   1. The child always inherits TOKENOMICA_CLASSIFYING=1 in its env (env vars
 //      propagate down an entire process tree by construction), and
 //      plugin/upload-session.js's SessionEnd hook exits immediately when it
 //      sees that var set — so the child's own SessionEnd never reaches this
 //      module at all.
 //   2. Belt-and-braces: classifyHeadless() itself refuses to spawn (returns
-//      null immediately) if CLAUDIUM_CLASSIFYING is ALREADY set in ITS OWN
+//      null immediately) if TOKENOMICA_CLASSIFYING is ALREADY set in ITS OWN
 //      env — so even a direct, mistaken re-entrant call can't nest.
 //
 // Dependency-free CJS (node builtins + sibling vendored lib files only) —
@@ -30,8 +30,8 @@
 
 const { spawn } = require('child_process');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
+const { configDir } = require('./config-dir');
 const { ACTIVITY_CATEGORIES, DOMAINS, BUILTIN_TOOLS, scrubText, FACT_KEYS } = require('./scrub');
 const { extractAbstraction, fallbackAbstraction, EXTRACTOR_VERSION } = require('./extract');
 
@@ -217,17 +217,17 @@ function parseHeadlessOutput(stdout) {
   };
 }
 
-function classifyDir(claudiumDir) {
-  return path.join(claudiumDir || path.join(os.homedir(), '.claudium'), 'classify');
+function classifyDir(tokenomicaDir) {
+  return path.join(tokenomicaDir || configDir(), 'classify');
 }
 
-// (final review, item 3): strips every CLAUDIUM_ENRICH_* key out of an env
+// (final review, item 3): strips every TOKENOMICA_ENRICH_* key out of an env
 // object before it crosses another process boundary (the `claude -p`
 // grandchild spawned below) — see classifyHeadless's spawnImpl call for why.
 function stripEnrichEnv(env) {
   const out = {};
   for (const k of Object.keys(env || {})) {
-    if (!k.startsWith('CLAUDIUM_ENRICH_')) out[k] = env[k];
+    if (!k.startsWith('TOKENOMICA_ENRICH_')) out[k] = env[k];
   }
   return out;
 }
@@ -238,27 +238,27 @@ function stripEnrichEnv(env) {
 // failure and falls back to the deterministic guess.
 //
 // opts: claudeBin (default 'claude'), timeoutMs (default 60000), spawnImpl
-// (default child_process.spawn — inject a fake for tests), claudiumDir
-// (REQUIRED to be a temp dir in tests — never the real ~/.claudium), env
+// (default child_process.spawn — inject a fake for tests), tokenomicaDir
+// (REQUIRED to be a temp dir in tests — never the real ~/.tokenomica), env
 // (default process.env).
 function classifyHeadless(digest, opts = {}) {
   // Recursion guard #2 (belt and braces) — see file header. If we are
   // somehow already running inside a classify child's own process tree,
   // never spawn another one.
-  if (process.env.CLAUDIUM_CLASSIFYING) return Promise.resolve(null);
+  if (process.env.TOKENOMICA_CLASSIFYING) return Promise.resolve(null);
 
   const {
     claudeBin = 'claude',
     timeoutMs = DEFAULT_TIMEOUT_MS,
     spawnImpl = spawn,
-    claudiumDir,
+    tokenomicaDir,
     env = process.env,
   } = opts;
 
   return new Promise((resolve) => {
     let cwd;
     try {
-      cwd = classifyDir(claudiumDir);
+      cwd = classifyDir(tokenomicaDir);
       fs.mkdirSync(cwd, { recursive: true });
     } catch {
       resolve(null);
@@ -277,22 +277,22 @@ function classifyHeadless(digest, opts = {}) {
     try {
       child = spawnImpl(claudeBin, args, {
         cwd,
-        // Recursion guard #1 (see file header): CLAUDIUM_CLASSIFYING=1
+        // Recursion guard #1 (see file header): TOKENOMICA_CLASSIFYING=1
         // propagates to this child's entire process tree, so any hook it
         // triggers on its own SessionEnd sees it too.
         //
         // (final review, item 3): `env` crosses TWO process boundaries by
         // the time it reaches here when this is invoked via
         // plugin/enrich-session.js — upload-session.js's spawnEnrich sets
-        // CLAUDIUM_ENRICH_* (including the hub bearer token,
-        // CLAUDIUM_ENRICH_TOKEN) on that child's env, and enrich() never
+        // TOKENOMICA_ENRICH_* (including the hub bearer token,
+        // TOKENOMICA_ENRICH_TOKEN) on that child's env, and enrich() never
         // overrides this function's own `env` default (`= process.env`).
         // The classify grandchild has no business seeing the hub bearer
         // token, the enrich API-key override, or any other enrich-session
-        // config — strip every CLAUDIUM_ENRICH_* key before merging in the
+        // config — strip every TOKENOMICA_ENRICH_* key before merging in the
         // recursion guard below. Scoped to that one prefix only: every other
         // env var (PATH, ANTHROPIC_API_KEY, etc.) still passes through.
-        env: Object.assign({}, stripEnrichEnv(env), { CLAUDIUM_CLASSIFYING: '1' }),
+        env: Object.assign({}, stripEnrichEnv(env), { TOKENOMICA_CLASSIFYING: '1' }),
       });
     } catch {
       resolve(null);

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
-// Claudium plugin — SessionEnd hook. Builds the privacy-scrubbed usage record
-// for the session that just finished and POSTs it to Claudium Cloud. Raw
+// Tokenomica plugin — SessionEnd hook. Builds the privacy-scrubbed usage record
+// for the session that just finished and POSTs it to Tokenomica Cloud. Raw
 // transcripts never leave the machine — unconditionally: there is no
 // transcript upload path at all (D1b/Task 17).
 //
 // CONTRACT: this process must NEVER disturb the user's session — every path
-// exits 0; failures go to stderr only. Config: ~/.claudium/plugin.json
+// exits 0; failures go to stderr only. Config: ~/.tokenomica/plugin.json
 // { "url": "https://…", "token": "…" }
 // (a stale "transcripts" key from an older config is silently ignored.)
 //
@@ -26,16 +26,21 @@ const { loadSalt } = require('./lib/anonymize');
 const { lastClassifyCost } = require('./lib/coach-ledger');
 // D4 (final review, item 1b): backfillAll's walk descends into EVERY project
 // dir under CLAUDE_DIR, including one derived from the classify() child's
-// own cwd (~/.claudium/classify) — buildFor must skip it explicitly, the
+// own cwd (~/.tokenomica/classify) — buildFor must skip it explicitly, the
 // same way it skips subagent sidecars below. Shared (not duplicated)
 // predicate — see lib/classify-path.js.
 const { isClassifyProjectPath } = require('./lib/classify-path');
+const { configDir } = require('./lib/config-dir');
 // Task 24 (G3): named sharing tiers, one config surface — resolveTier is the
 // SAME resolver the sender pipeline uses (lib/sharing-tiers.js, vendored
 // here by scripts/build-plugin.js), so both routes read one `tier` key off
-// the SAME plugin.json (loadConfig, below) and the SAME CLAUDIUM_TIER/legacy
+// the SAME plugin.json (loadConfig, below) and the SAME TOKENOMICA_TIER/legacy
 // env precedence.
 const { resolveTier, describeTier, TIERS } = require('./lib/sharing-tiers');
+// Task 7: the deferred re-survey orchestrator (Task 5, vendored) — pure/
+// dependency-free, injected with THIS file's own session enumeration, build,
+// post, and ledger I/O so it runs identically here and on the sender route.
+const { resurveyAged } = require('./lib/resurvey');
 
 // Task 14 item 1: plugin/enrich-session.js is the fully detached
 // classification child — a real separate node process, spawned by
@@ -43,12 +48,12 @@ const { resolveTier, describeTier, TIERS } = require('./lib/sharing-tiers');
 // exactly like this file.
 const ENRICH_SCRIPT = path.join(__dirname, 'enrich-session.js');
 
-const CONFIG_PATH = path.join(os.homedir(), '.claudium', 'plugin.json');
+const CONFIG_PATH = path.join(configDir(), 'plugin.json');
 const CLAUDE_DIR = process.env.CLAUDE_DIR || path.join(os.homedir(), '.claude', 'projects');
 const MARKER_PATH = path.join(path.dirname(CONFIG_PATH), 'backfilled');
 // A1: same directory as plugin.json/backfilled — this is where the
 // per-machine HMAC salt (lib/anonymize.js's loadSalt) lives too.
-const CLAUDIUM_DIR = path.dirname(CONFIG_PATH);
+const TOKENOMICA_DIR = path.dirname(CONFIG_PATH);
 
 // Task 15 item 2: this is the ONE place the plugin route reads plugin.json —
 // every config-derived value below (classify gate, project label overrides,
@@ -72,7 +77,7 @@ function loadConfig(p = CONFIG_PATH) {
     // "transcripts" key from an older config is simply never read here —
     // tolerated silently, never an error.
     // Task 24 (G3): resolve the named sharing tier from THIS SAME parsed
-    // plugin.json (a `tier` key) plus process.env (CLAUDIUM_TIER, and the
+    // plugin.json (a `tier` key) plus process.env (TOKENOMICA_TIER, and the
     // legacy BRAIN_SHARING/BRAIN_USAGE envs, mapped conservatively — see
     // lib/sharing-tiers.js's resolveTier for the full precedence/mapping).
     const { tier, flags, legacyWarning } = resolveTier(cfg, process.env);
@@ -96,8 +101,16 @@ const isSubagentPath = p => /[/\\]subagents[/\\]/.test(String(p || ''));
 // buildRecordForFile, and because the ENRICHED rebuild (plugin/enrich-session.js,
 // where classify() actually runs) is a separate process that reads the same
 // flag across its own env-var boundary (see spawnEnrich's
-// CLAUDIUM_ENRICH_SHIP_FACTS below).
-async function buildFor(filepath, claudeDir, { projectLabels, claudiumDir = CLAUDIUM_DIR, shipFacts = true } = {}) {
+// TOKENOMICA_ENRICH_SHIP_FACTS below).
+// gitTruth (Task 7): when true, and the session has a cwd and at least one
+// commit, re-derive numbers-only code-survival stats (lib/git-truth.js's
+// analyzeGitTruth — runs `git` INSIDE session.cwd, on the machine that still
+// has that repo checked out) and thread them into buildRecord the same way
+// lib/usage-pipeline.js's buildRecordForFile already does on the sender
+// route. Day-0 SessionEnd calls never pass gitTruth (survival only means
+// something once the code has had days to hold up or get rewritten) —
+// runResurvey (below) is the only caller that does.
+async function buildFor(filepath, claudeDir, { projectLabels, tokenomicaDir = TOKENOMICA_DIR, shipFacts = true, gitTruth = false } = {}) {
   if (isSubagentPath(filepath)) return null;
   if (isClassifyProjectPath(filepath)) return null;   // never ingest the classify() child's own transcript
   const raw = await fs.promises.readFile(filepath, 'utf8');
@@ -110,14 +123,18 @@ async function buildFor(filepath, claudeDir, { projectLabels, claudiumDir = CLAU
   if (!session.turnCount) return null;
   const metrics = computeMetrics(session);
   const abstraction = fallbackAbstraction(session);
-  // Ledger read follows the same claudiumDir as the salt below (the real
-  // CLAUDIUM_DIR on the shipping path; tests pass a temp dir).
+  let truth = null;
+  if (gitTruth && session.cwd && session.commits > 0) {
+    try { truth = require('./lib/git-truth').analyzeGitTruth({ cwd: session.cwd, startedAt: session.startedAt, endedAt: session.endedAt }); } catch {}
+  }
+  // Ledger read follows the same tokenomicaDir as the salt below (the real
+  // TOKENOMICA_DIR on the shipping path; tests pass a temp dir).
   let coachNudges = [];
-  try { coachNudges = require('./lib/coach-ledger').nudgesFor(session.claudeSessionId, { dir: claudiumDir }); } catch {}
+  try { coachNudges = require('./lib/coach-ledger').nudgesFor(session.claudeSessionId, { dir: tokenomicaDir }); } catch {}
   // A1: this is a SHIPPED path — always pseudonymize project_label
   // (per-machine salt, created on demand; user-assigned overrides win).
-  const salt = loadSalt(claudiumDir);
-  return { record: buildRecord({ session, metrics, abstraction, coachNudges, salt, projectLabels, shipFacts }), session };
+  const salt = loadSalt(tokenomicaDir);
+  return { record: buildRecord({ session, metrics, abstraction, gitTruth: truth, coachNudges, salt, projectLabels, shipFacts }), session };
 }
 
 async function post(base, apiPath, token, body, fetchImpl) {
@@ -145,13 +162,13 @@ async function uploadOne(filepath, claudeDir, cfg, fetchImpl = globalThis.fetch)
   if (!flags.usage) return 'skip';
   try {
     const built = await buildFor(filepath, claudeDir,
-      { projectLabels: cfg.projectLabels, claudiumDir: cfg.claudiumDir, shipFacts: flags.facts });
+      { projectLabels: cfg.projectLabels, tokenomicaDir: cfg.tokenomicaDir, shipFacts: flags.facts });
     if (!built) return 'skip';
     const base = String(cfg.url).replace(/\/+$/, '');
     const r = await post(base, '/api/records', cfg.token, built.record, fetchImpl);
-    if (!r || !r.ok) { console.error(`claudium: record not stored (${r && r.status})`); return false; }
+    if (!r || !r.ok) { console.error(`tokenomica: record not stored (${r && r.status})`); return false; }
     return true;
-  } catch (e) { console.error(`claudium: upload failed: ${e.message}`); return false; }
+  } catch (e) { console.error(`tokenomica: upload failed: ${e.message}`); return false; }
 }
 
 // Task 14 item 1: spawns lib/classify-headless.js's classify() ladder in a
@@ -163,14 +180,14 @@ async function uploadOne(filepath, claudeDir, cfg, fetchImpl = globalThis.fetch)
 // enrich-session.js's own file header for that side of the contract).
 //
 // Config/state cross the process boundary via env vars only (stdio is
-// ignored, so no pipe is available) — CLAUDIUM_ENRICH_* below is the whole
+// ignored, so no pipe is available) — TOKENOMICA_ENRICH_* below is the whole
 // contract; plugin/enrich-session.js's optsFromEnv reads the same names.
 //
 // Recursion note: this is reachable ONLY from within runHook, which has
-// already returned early if CLAUDIUM_CLASSIFYING is set on ITS OWN env (see
+// already returned early if TOKENOMICA_CLASSIFYING is set on ITS OWN env (see
 // runHook below) — so this never fires from inside a classify child's own
 // SessionEnd. The env passed to the CHILD here is never given
-// CLAUDIUM_CLASSIFYING itself; only classifyHeadless()'s OWN spawned
+// TOKENOMICA_CLASSIFYING itself; only classifyHeadless()'s OWN spawned
 // `claude -p` (a grandchild, deep inside the enrichment child) gets that.
 function spawnEnrich(fp, claudeDir, cfg, { spawnImpl = spawn } = {}) {
   try {
@@ -179,30 +196,30 @@ function spawnEnrich(fp, claudeDir, cfg, { spawnImpl = spawn } = {}) {
       detached: true,
       stdio: 'ignore',
       env: Object.assign({}, process.env, {
-        CLAUDIUM_ENRICH_FILE: fp,
-        CLAUDIUM_ENRICH_CLAUDE_DIR: claudeDir,
-        CLAUDIUM_ENRICH_URL: cfg.url,
-        CLAUDIUM_ENRICH_TOKEN: cfg.token,
-        CLAUDIUM_ENRICH_CLAUDIUM_DIR: cfg.claudiumDir || CLAUDIUM_DIR,
-        CLAUDIUM_ENRICH_PROJECT_LABELS: JSON.stringify(cfg.projectLabels || {}),
+        TOKENOMICA_ENRICH_FILE: fp,
+        TOKENOMICA_ENRICH_CLAUDE_DIR: claudeDir,
+        TOKENOMICA_ENRICH_URL: cfg.url,
+        TOKENOMICA_ENRICH_TOKEN: cfg.token,
+        TOKENOMICA_ENRICH_TOKENOMICA_DIR: cfg.tokenomicaDir || TOKENOMICA_DIR,
+        TOKENOMICA_ENRICH_PROJECT_LABELS: JSON.stringify(cfg.projectLabels || {}),
         // Task 15 item 2: the optional plugin.json auth override, threaded
         // across the process boundary the same way every other cfg field is
         // (stdio is 'ignore' — env vars are the whole contract). Empty
         // string, never undefined, when no override is configured.
-        CLAUDIUM_ENRICH_API_KEY: cfg.apiKey || '',
+        TOKENOMICA_ENRICH_API_KEY: cfg.apiKey || '',
         // Task 24 (G3): the resolved tier's `facts` flag, threaded the same
         // way — '0' forces the enriched re-POST's session_facts to []
         // (tier 'metrics'); '1' (the default, matching TIERS.full) ships
         // them. A cfg with no .flags at all (direct-construction callers)
         // defaults to '1', same backward-compatible fallback as uploadOne's
         // effectiveFlags.
-        CLAUDIUM_ENRICH_SHIP_FACTS: effectiveFlags(cfg).facts ? '1' : '0',
+        TOKENOMICA_ENRICH_SHIP_FACTS: effectiveFlags(cfg).facts ? '1' : '0',
       }),
     });
     if (child && typeof child.unref === 'function') child.unref();
     return child;
   } catch (e) {
-    console.error(`claudium: enrich spawn failed: ${e.message}`);
+    console.error(`tokenomica: enrich spawn failed: ${e.message}`);
     return null;
   }
 }
@@ -228,21 +245,21 @@ function readStdinJson() {
 
 async function runHook(opts = {}) {
   // D4 recursion guard: lib/classify-headless.js spawns `claude -p` as a
-  // child with CLAUDIUM_CLASSIFYING=1 in its env (inherited down that
+  // child with TOKENOMICA_CLASSIFYING=1 in its env (inherited down that
   // child's whole process tree). If THIS SessionEnd hook fires again for
   // that child's own session, bail out immediately — never sessionize or
   // classify the classifier's own transcript, or the recursion never ends.
   // This also means uploadAndEnrich/spawnEnrich below are NEVER reached from
   // inside a classify child's own SessionEnd — the guard is upstream of them.
-  if (process.env.CLAUDIUM_CLASSIFYING) return;
+  if (process.env.TOKENOMICA_CLASSIFYING) return;
   const cfg = loadConfig();
-  if (!cfg) { console.error('claudium: no config — run the connect setup from /connect first'); return; }
+  if (!cfg) { console.error('tokenomica: no config — run the connect setup from /connect first'); return; }
   // Task 24 (G3): a legacy BRAIN_SHARING/BRAIN_USAGE env resolved the tier
-  // conservatively rather than an explicit tier/CLAUDIUM_TIER — warn once.
+  // conservatively rather than an explicit tier/TOKENOMICA_TIER — warn once.
   // Each SessionEnd hook invocation is itself a fresh, short-lived process,
   // so printing here satisfies "once per boot" the same way the sender
   // daemon's single boot-time print does.
-  if (cfg.legacyWarning) console.error(`claudium: ${cfg.legacyWarning}`);
+  if (cfg.legacyWarning) console.error(`tokenomica: ${cfg.legacyWarning}`);
   const input = await readStdinJson();
   const fp = input && input.transcript_path;
   // Task 14 item 1: POST immediately with deterministic labels (uploadOne,
@@ -250,9 +267,12 @@ async function runHook(opts = {}) {
   // turned off — spawn the fully detached enrichment child. Either way this
   // hook exits 0 right after, never having waited on an LLM.
   if (fp) await uploadAndEnrich(fp, CLAUDE_DIR, cfg, opts);
-  else console.error('claudium: hook input had no transcript_path');
+  else console.error('tokenomica: hook input had no transcript_path');
   try { await maybeAutoBackfill(cfg); }
-  catch (e) { console.error(`claudium: auto-backfill: ${e.message}`); }
+  catch (e) { console.error(`tokenomica: auto-backfill: ${e.message}`); }
+  // Deferred code-survival: re-blame a few aged sessions. Best-effort and
+  // capped — session end must never block on it.
+  try { await runResurvey(cfg, CLAUDE_DIR, { maxPerRun: 3 }); } catch {}
 }
 
 async function backfillAll(cfg, claudeDir = CLAUDE_DIR, fetchImpl = globalThis.fetch) {
@@ -264,7 +284,7 @@ async function backfillAll(cfg, claudeDir = CLAUDE_DIR, fetchImpl = globalThis.f
       const fp = path.join(dir, e.name);
       if (e.isDirectory()) { if (e.name === 'subagents') continue; await walk(fp); }
       else if (e.name.endsWith('.jsonl')) {
-        process.stderr.write(`claudium: backfill ${e.name}\n`);
+        process.stderr.write(`tokenomica: backfill ${e.name}\n`);
         const out = await uploadOne(fp, claudeDir, cfg, fetchImpl);
         if (out !== 'skip') { attempted++; if (out === true) stored++; }
       }
@@ -274,6 +294,86 @@ async function backfillAll(cfg, claudeDir = CLAUDE_DIR, fetchImpl = globalThis.f
   return { attempted, stored };
 }
 
+// Task 7: local session enumerator for the deferred re-survey pass. Reuses
+// backfillAll's own mtime-based walk pattern (same subagents-dir skip) but
+// only needs {file, id, endedAt} — resurveyAged does its own age filtering
+// off endedAt, so mtime (not the transcript's own internal endedAt, which
+// would require a full parse per file just to enumerate) is the cheap,
+// good-enough proxy: a session's last jsonl write IS effectively when it
+// ended.
+async function listLocalSessions(claudeDir) {
+  const out = [];
+  const walk = async (dir) => {
+    let ents; try { ents = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const fp = path.join(dir, e.name);
+      if (e.isDirectory()) { if (e.name === 'subagents') continue; await walk(fp); }
+      else if (e.name.endsWith('.jsonl')) {
+        try { const st = await fs.promises.stat(fp); out.push({ file: fp, id: path.basename(fp, '.jsonl'), endedAt: st.mtime.toISOString() }); } catch {}
+      }
+    }
+  };
+  await walk(claudeDir);
+  return out;
+}
+
+// Task 7: the ledger of already-resurveyed session ids — a plain JSON array
+// under TOKENOMICA_DIR (same directory as plugin.json/backfilled/salt), read
+// wholesale into a Set and written back merged (never overwritten) so a
+// crash mid-run can't drop earlier progress. The ledger PATH is injectable
+// (mirrors how runBackfill threads markerFile = MARKER_PATH in this same
+// file): real callers use the default RESURVEY_LEDGER; tests point it at a
+// throwaway temp file so the happy path is exercisable without ever touching
+// the real ~/.tokenomica.
+const RESURVEY_LEDGER = path.join(TOKENOMICA_DIR, 'resurvey.json');
+
+function loadResurveyLedger(ledgerPath = RESURVEY_LEDGER) {
+  try { return new Set(JSON.parse(fs.readFileSync(ledgerPath, 'utf8'))); } catch { return new Set(); }
+}
+function saveResurveyLedger(ids, ledgerPath = RESURVEY_LEDGER) {
+  const cur = loadResurveyLedger(ledgerPath);
+  ids.forEach(x => cur.add(x));
+  try { fs.mkdirSync(path.dirname(ledgerPath), { recursive: true }); fs.writeFileSync(ledgerPath, JSON.stringify([...cur])); } catch {}
+}
+
+// Task 7: drains a handful of aged local sessions through lib/resurvey.js's
+// resurveyAged — rebuilds each with gitTruth:true (buildFor, above) and
+// re-POSTs; the hub upserts over the day-0 record in place. Gated by the
+// SAME usage flag every other shipping route funnels through (effectiveFlags)
+// so a non-shipping tier never re-blames OR re-uploads anything.
+// maxPerRun is small (3) from the SessionEnd hook (never hang session end)
+// and large from the explicit /tokenomica:resurvey command (drains the
+// backlog on demand). ledgerPath defaults to the real RESURVEY_LEDGER —
+// tests override it (same injectable pattern as runBackfill's markerFile).
+async function runResurvey(cfg, claudeDir = CLAUDE_DIR, { maxPerRun = 3, fetchImpl = globalThis.fetch, ledgerPath = RESURVEY_LEDGER } = {}) {
+  const flags = effectiveFlags(cfg);
+  if (!flags.usage) return { surveyed: 0, skipped: 0 };
+  const base = String(cfg.url).replace(/\/+$/, '');
+  const sessions = await listLocalSessions(claudeDir);
+  return resurveyAged({
+    listSessions: () => sessions,
+    buildOne: (file) => buildFor(file, claudeDir, { projectLabels: cfg.projectLabels, tokenomicaDir: cfg.tokenomicaDir, shipFacts: flags.facts, gitTruth: true }),
+    post: (rec) => post(base, '/api/records', cfg.token, rec, fetchImpl),
+    loadLedger: () => loadResurveyLedger(ledgerPath),
+    saveLedger: (ids) => saveResurveyLedger(ids, ledgerPath),
+    now: Date.now(), maxPerRun,
+  });
+}
+
+// /tokenomica:resurvey — the explicit, on-demand counterpart to the
+// SessionEnd hook's own small (maxPerRun: 3) background pass above: drains
+// the WHOLE backlog of aged sessions in one go. A thin CLI wrapper —
+// runResurvey itself takes an already-loaded cfg, so this is the one place
+// that loads it (mirrors runBackfill/runStatus's own configPath param) —
+// lets the command doc's invocation (plugin/commands/resurvey.md) call this
+// file with no arguments beyond --resurvey.
+async function runResurveyCommand({ configPath = CONFIG_PATH, claudeDir = CLAUDE_DIR, fetchImpl = globalThis.fetch } = {}) {
+  const cfg = loadConfig(configPath);
+  if (!cfg) { console.log('Not connected — run /tokenomica:status'); return; }
+  const { surveyed } = await runResurvey(cfg, claudeDir, { maxPerRun: 1000, fetchImpl });
+  console.log(`Re-surveyed ${surveyed} session(s).`);
+}
+
 // Task 25 (G4): first-run history import is CONSENTED to, never silent.
 // SessionEnd used to auto-import history in the background the first time it
 // ran (see git history for that version) — that's gone. maybeAutoBackfill
@@ -281,7 +381,7 @@ async function backfillAll(cfg, claudeDir = CLAUDE_DIR, fetchImpl = globalThis.f
 // "backfill-notice" marker (a sibling of MARKER_PATH, same directory) and
 // prints a best-effort stderr line, so the pending state doesn't get
 // re-announced every single session end. The actual import only ever
-// happens through the explicit /claudium:backfill command (runBackfill,
+// happens through the explicit /tokenomica:backfill command (runBackfill,
 // below), which is the ONE place any history now leaves the machine
 // unprompted-by-a-live-session (still gated by uploadOne's normal record
 // build, still deterministic-only — see buildFor's own header comment).
@@ -294,7 +394,7 @@ async function backfillAll(cfg, claudeDir = CLAUDE_DIR, fetchImpl = globalThis.f
 // every path exits 0, so nothing ever surfaces in-session). So the stderr
 // line below is best-effort only (visible to someone tailing logs, never to
 // the user in-session) — the notice that actually reaches the user is
-// /claudium:status's "history import: pending — run /claudium:backfill"
+// /tokenomica:status's "history import: pending — run /tokenomica:backfill"
 // line (runStatus, below), which is why the notice marker's ONLY job is
 // de-duplicating this function's own side effects across repeated
 // SessionEnd invocations, not the user-visible state itself (that's just
@@ -310,20 +410,20 @@ async function maybeAutoBackfill(cfg, {
   // Defaults to a sibling of markerFile — this means every existing caller
   // that already overrides markerFile alone (this file's own tests, and
   // plugin-enrich-gate.test.js) automatically gets a hermetic noticeFile too,
-  // with no risk of ever touching the real ~/.claudium/backfill-notice.
+  // with no risk of ever touching the real ~/.tokenomica/backfill-notice.
   noticeFile = path.join(path.dirname(markerFile), 'backfill-notice'),
 } = {}) {
   if (!effectiveFlags(cfg).usage) return false;
   if (fs.existsSync(markerFile)) return false;
   if (fs.existsSync(noticeFile)) return false;
-  console.error('claudium: history import is pending — run /claudium:backfill to import your existing session history, or /claudium:backfill --skip to dismiss this notice');
+  console.error('tokenomica: history import is pending — run /tokenomica:backfill to import your existing session history, or /tokenomica:backfill --skip to dismiss this notice');
   try { fs.writeFileSync(noticeFile, JSON.stringify({ at: new Date().toISOString() }) + '\n'); } catch {}
   return true;
 }
 
-// /claudium:backfill — the explicit, consensual counterpart to the notice
+// /tokenomica:backfill — the explicit, consensual counterpart to the notice
 // above. Mirrors runStatus's injectable configPath/markerFile/claudeDir/
-// fetchImpl pattern so tests never touch the real ~/.claudium or network.
+// fetchImpl pattern so tests never touch the real ~/.tokenomica or network.
 // `skip` (the command's `--skip` flag) records an explicit decline WITHOUT
 // importing anything — it writes the SAME marker file maybeAutoBackfill and
 // this function both check, so declining stops the notice for good, exactly
@@ -341,7 +441,7 @@ async function runBackfill({
 
   if (skip) {
     fs.writeFileSync(markerFile, JSON.stringify({ at: new Date().toISOString(), skipped: true }) + '\n');
-    console.log('history import: skipped by user — nothing imported; run /claudium:backfill any time to import later');
+    console.log('history import: skipped by user — nothing imported; run /tokenomica:backfill any time to import later');
     return;
   }
 
@@ -380,15 +480,15 @@ function classificationMode(cfg) {
   return 'on (headless — your Claude Code login)';
 }
 
-// /claudium:status — never prints the token, always exits 0. configPath/
-// markerPath/claudiumDir are injectable (mirrors loadConfig's own `p` param)
-// so tests can point this at a throwaway dir instead of the real ~/.claudium.
-async function runStatus(fetchImpl = globalThis.fetch, { configPath = CONFIG_PATH, markerPath = MARKER_PATH, claudiumDir = CLAUDIUM_DIR } = {}) {
+// /tokenomica:status — never prints the token, always exits 0. configPath/
+// markerPath/tokenomicaDir are injectable (mirrors loadConfig's own `p` param)
+// so tests can point this at a throwaway dir instead of the real ~/.tokenomica.
+async function runStatus(fetchImpl = globalThis.fetch, { configPath = CONFIG_PATH, markerPath = MARKER_PATH, tokenomicaDir = TOKENOMICA_DIR } = {}) {
   const cfg = loadConfig(configPath);
   if (!cfg) { console.log('config: missing — set up at your dashboard’s /connect page'); return; }
   console.log(`config: ${cfg.url} · token set`);
   // Task 25 (G4): three states off the SAME marker file runBackfill (the
-  // /claudium:backfill command) and maybeAutoBackfill's notice both read —
+  // /tokenomica:backfill command) and maybeAutoBackfill's notice both read —
   // no marker at all means the import is still pending (a plain "backfilled"
   // marker with skipped:true means the user explicitly declined, above the
   // marker.at check so a skip never reads as "done").
@@ -396,11 +496,11 @@ async function runStatus(fetchImpl = globalThis.fetch, { configPath = CONFIG_PAT
   try { marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')); } catch {}
   console.log(marker && marker.skipped ? `history import: skipped by user (${marker.at})`
     : marker && marker.at ? `history import: done (${marker.at})`
-    : 'history import: pending — run /claudium:backfill');
+    : 'history import: pending — run /tokenomica:backfill');
   console.log(`classification: ${classificationMode(cfg)}`);
   // Task 24 (G3): the resolved sharing tier + its one-line meaning — the
   // SAME tier lib/sharing-tiers.js's resolveTier computed inside loadConfig
-  // above (CLAUDIUM_TIER > plugin.json "tier" > legacy env, conservatively >
+  // above (TOKENOMICA_TIER > plugin.json "tier" > legacy env, conservatively >
   // default 'full'). If a legacy env resolved it, surface that too, so
   // status doubles as the "boot warning" surface for a one-off status check.
   console.log(`sharing tier: ${cfg.tier} — ${describeTier(cfg.tier)}`);
@@ -408,9 +508,9 @@ async function runStatus(fetchImpl = globalThis.fetch, { configPath = CONFIG_PAT
   // Task 15 item 1/3: the coach ledger's last classify_cost entry — logged by
   // both capture routes (plugin/enrich-session.js, lib/usage-pipeline.js)
   // after every successful non-deterministic classification. Best-effort: a
-  // ledger read failure must never break /claudium:status.
+  // ledger read failure must never break /tokenomica:status.
   let last = null;
-  try { last = lastClassifyCost({ dir: claudiumDir }); } catch { /* status must always report something */ }
+  try { last = lastClassifyCost({ dir: tokenomicaDir }); } catch { /* status must always report something */ }
   console.log(last
     ? `last classification: ${last.activity_category || 'unknown'} · ${last.domain || 'unknown'} · $${Number(last.cost_usd || 0).toFixed(6)} (${last.classifier || 'unknown'})`
     : 'last classification: none yet');
@@ -423,13 +523,17 @@ async function runStatus(fetchImpl = globalThis.fetch, { configPath = CONFIG_PAT
 }
 
 module.exports = { loadConfig, buildFor, uploadOne, uploadAndEnrich, spawnEnrich, runHook, runBackfill,
-  backfillAll, maybeAutoBackfill, runStatus, classifyProbe, CONFIG_PATH, MARKER_PATH };
+  backfillAll, maybeAutoBackfill, runStatus, classifyProbe, runResurvey, runResurveyCommand, CONFIG_PATH, MARKER_PATH };
 
 if (require.main === module) {
-  // Task 25 (G4): --skip travels alongside --backfill (the /claudium:backfill
+  // Task 25 (G4): --skip travels alongside --backfill (the /tokenomica:backfill
   // command's `$ARGUMENTS` pass-through — see plugin/commands/backfill.md) —
-  // e.g. `/claudium:backfill --skip` runs this file with both flags present.
+  // e.g. `/tokenomica:backfill --skip` runs this file with both flags present.
+  // Task 7: --resurvey is the /tokenomica:resurvey command's own invocation
+  // (plugin/commands/resurvey.md) — same dispatch pattern.
   const main = process.argv.includes('--backfill') ? () => runBackfill({ skip: process.argv.includes('--skip') })
-    : process.argv.includes('--status') ? runStatus : runHook;
-  main().then(() => process.exit(0)).catch(e => { console.error(`claudium: ${e.message}`); process.exit(0); });
+    : process.argv.includes('--status') ? runStatus
+    : process.argv.includes('--resurvey') ? runResurveyCommand
+    : runHook;
+  main().then(() => process.exit(0)).catch(e => { console.error(`tokenomica: ${e.message}`); process.exit(0); });
 }

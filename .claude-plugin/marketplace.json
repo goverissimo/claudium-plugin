@@ -1,7 +1,7 @@
 {
-  "name": "claudium",
-  "owner": { "name": "Claudium" },
+  "name": "tokenomica",
+  "owner": { "name": "Tokenomica" },
   "plugins": [
-    { "name": "claudium", "source": "./plugin", "description": "Claudium usage uploader — session-end hook" }
+    { "name": "tokenomica", "source": "./plugin", "description": "Tokenomica usage uploader — session-end hook" }
   ]
 }

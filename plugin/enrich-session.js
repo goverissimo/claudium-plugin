@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
-// plugin/enrich-session.js — Claudium plugin — SessionEnd enrichment child.
+// plugin/enrich-session.js — Tokenomica plugin — SessionEnd enrichment child.
 //
 // plugin/upload-session.js's SessionEnd hook (runHook -> uploadAndEnrich)
 // posts a fast, deterministic record and exits 0 immediately — it never
@@ -19,15 +19,15 @@
 // attached — stdio is 'ignore' in production) and the process always exits
 // 0. The deterministic record already landed; enrichment is pure upside.
 //
-// Config crosses the process boundary via CLAUDIUM_ENRICH_* env vars only
+// Config crosses the process boundary via TOKENOMICA_ENRICH_* env vars only
 // (spawnEnrich passes no stdin/pipe — stdio is fully ignored); optsFromEnv
 // below is the read side of that same contract.
 //
 // Recursion note (inherits D4's design — see lib/classify-headless.js's
-// file header): classify() may spawn `claude -p` with CLAUDIUM_CLASSIFYING=1
+// file header): classify() may spawn `claude -p` with TOKENOMICA_CLASSIFYING=1
 // set on THAT child's env — a grandchild relative to the original hook,
 // never on THIS process's own env. This process itself is not given
-// CLAUDIUM_CLASSIFYING (spawnEnrich never sets it, and runHook never spawns
+// TOKENOMICA_CLASSIFYING (spawnEnrich never sets it, and runHook never spawns
 // this script while that guard is active in the first place); if it
 // somehow were set anyway, classifyHeadless's own belt-and-braces guard
 // refuses to spawn again regardless (see lib/classify-headless.js).
@@ -71,7 +71,7 @@ async function post(base, apiPath, token, body, fetchImpl) {
 }
 
 // enrich(opts) -> Promise<boolean> — true iff the enriched record was
-// posted and stored. opts: filepath, claudeDir, url, token, claudiumDir,
+// posted and stored. opts: filepath, claudeDir, url, token, tokenomicaDir,
 // projectLabels (default {}), apiKey (default '' -> classify() itself falls
 // through to process.env.ANTHROPIC_API_KEY), fetchImpl (default
 // globalThis.fetch), classifyImpl (default lib/classify-headless.js's
@@ -82,15 +82,15 @@ async function post(base, apiPath, token, body, fetchImpl) {
 // below) but forces session_facts to [] on the record this re-POSTs — the
 // SAME enforcement seam lib/record.js's buildRecord provides on the sender
 // route (lib/usage-pipeline.js's enrichAndRepost). Threaded across the
-// process boundary via CLAUDIUM_ENRICH_SHIP_FACTS (see optsFromEnv below;
+// process boundary via TOKENOMICA_ENRICH_SHIP_FACTS (see optsFromEnv below;
 // spawnEnrich in plugin/upload-session.js is the write side).
-async function enrich({ filepath, claudeDir, url, token, claudiumDir, projectLabels = {},
+async function enrich({ filepath, claudeDir, url, token, tokenomicaDir, projectLabels = {},
   apiKey = '', fetchImpl = globalThis.fetch, classifyImpl = classify, shipFacts = true } = {}) {
   const session = await assembleSession(filepath, claudeDir);
   if (!session) return false;
 
   const metrics = computeMetrics(session);
-  const result = await classifyImpl(session, metrics, { apiKey, fetchImpl, claudiumDir });
+  const result = await classifyImpl(session, metrics, { apiKey, fetchImpl, tokenomicaDir });
 
   // Task 15 item 5 (fold-forward, Task 14 review minor): classify() bottoming
   // out to the deterministic guess means the auth ladder produced NOTHING new
@@ -102,7 +102,7 @@ async function enrich({ filepath, claudeDir, url, token, claudiumDir, projectLab
 
   // Task 15 item 1: log cost for every successful NON-deterministic
   // classification (i.e. we got past the guard above) — one entry per
-  // enrichment, in the SAME ~/.claudium/coach-log.jsonl the coach's nudges
+  // enrichment, in the SAME ~/.tokenomica/coach-log.jsonl the coach's nudges
   // live in. Never a nudge itself (lib/coach-ledger.js's nudgesFor
   // explicitly excludes this kind). Best-effort: a ledger write failure must
   // never block the re-POST that follows.
@@ -110,7 +110,7 @@ async function enrich({ filepath, claudeDir, url, token, claudiumDir, projectLab
     require('./lib/coach-ledger').logClassifyCost({
       sessionId: session.claudeSessionId, costUsd: result.cost_usd,
       classifier: result.classifier, activityCategory: result.activity_category, domain: result.domain,
-    }, { dir: claudiumDir });
+    }, { dir: tokenomicaDir });
   } catch { /* best-effort — never block enrichment on a ledger write failure */ }
 
   // Task 14 item 3: map the classify() result into the abstraction shape
@@ -132,8 +132,8 @@ async function enrich({ filepath, claudeDir, url, token, claudiumDir, projectLab
   };
 
   let coachNudges = [];
-  try { coachNudges = require('./lib/coach-ledger').nudgesFor(session.claudeSessionId, { dir: claudiumDir }); } catch {}
-  const salt = loadSalt(claudiumDir);
+  try { coachNudges = require('./lib/coach-ledger').nudgesFor(session.claudeSessionId, { dir: tokenomicaDir }); } catch {}
+  const salt = loadSalt(tokenomicaDir);
   const record = buildRecord({ session, metrics, abstraction, coachNudges, salt, projectLabels, shipFacts });
 
   const base = String(url).replace(/\/+$/, '');
@@ -142,28 +142,28 @@ async function enrich({ filepath, claudeDir, url, token, claudiumDir, projectLab
 }
 
 // optsFromEnv(env) -> enrich() opts. The read side of spawnEnrich's
-// CLAUDIUM_ENRICH_* env-var contract (plugin/upload-session.js).
+// TOKENOMICA_ENRICH_* env-var contract (plugin/upload-session.js).
 function optsFromEnv(env = process.env) {
   let projectLabels = {};
-  try { projectLabels = JSON.parse(env.CLAUDIUM_ENRICH_PROJECT_LABELS || '{}'); } catch { projectLabels = {}; }
+  try { projectLabels = JSON.parse(env.TOKENOMICA_ENRICH_PROJECT_LABELS || '{}'); } catch { projectLabels = {}; }
   return {
-    filepath: env.CLAUDIUM_ENRICH_FILE,
-    claudeDir: env.CLAUDIUM_ENRICH_CLAUDE_DIR,
-    url: env.CLAUDIUM_ENRICH_URL,
-    token: env.CLAUDIUM_ENRICH_TOKEN,
-    claudiumDir: env.CLAUDIUM_ENRICH_CLAUDIUM_DIR,
+    filepath: env.TOKENOMICA_ENRICH_FILE,
+    claudeDir: env.TOKENOMICA_ENRICH_CLAUDE_DIR,
+    url: env.TOKENOMICA_ENRICH_URL,
+    token: env.TOKENOMICA_ENRICH_TOKEN,
+    tokenomicaDir: env.TOKENOMICA_ENRICH_TOKENOMICA_DIR,
     // Task 15 item 2: the plugin.json auth override (threaded through by
-    // spawnEnrich as CLAUDIUM_ENRICH_API_KEY) wins over whatever ambient
+    // spawnEnrich as TOKENOMICA_ENRICH_API_KEY) wins over whatever ambient
     // ANTHROPIC_API_KEY this child inherited from process.env — a
     // deliberate in-config choice beats a leftover shell env var.
-    apiKey: env.CLAUDIUM_ENRICH_API_KEY || env.ANTHROPIC_API_KEY || '',
+    apiKey: env.TOKENOMICA_ENRICH_API_KEY || env.ANTHROPIC_API_KEY || '',
     projectLabels,
     // Task 24 (G3): the resolved tier's facts flag (spawnEnrich's write
     // side lives in plugin/upload-session.js). Only a literal '0' turns it
     // off — absent (undefined, an older spawnEnrich) or '1' both ship facts,
-    // matching every other CLAUDIUM_ENRICH_* field's backward-compatible
+    // matching every other TOKENOMICA_ENRICH_* field's backward-compatible
     // "missing means today's default" behavior.
-    shipFacts: env.CLAUDIUM_ENRICH_SHIP_FACTS !== '0',
+    shipFacts: env.TOKENOMICA_ENRICH_SHIP_FACTS !== '0',
   };
 }
 
@@ -172,5 +172,5 @@ module.exports = { enrich, assembleSession, optsFromEnv };
 if (require.main === module) {
   enrich(optsFromEnv(process.env))
     .then(() => process.exit(0))
-    .catch(e => { try { console.error(`claudium: enrich failed: ${e.message}`); } catch {} process.exit(0); });
+    .catch(e => { try { console.error(`tokenomica: enrich failed: ${e.message}`); } catch {} process.exit(0); });
 }

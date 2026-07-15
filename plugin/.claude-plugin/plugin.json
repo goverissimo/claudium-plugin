@@ -1,7 +1,7 @@
 {
-  "name": "claudium",
-  "description": "Uploads privacy-scrubbed Claude Code usage records to your team's Claudium dashboard when a session ends. Raw transcripts never leave your machine.",
-  "version": "1.3.0",
-  "author": { "name": "Claudium" },
+  "name": "tokenomica",
+  "description": "Uploads privacy-scrubbed Claude Code usage records to your team's Tokenomica dashboard when a session ends. Raw transcripts never leave your machine.",
+  "version": "1.4.0",
+  "author": { "name": "Tokenomica" },
   "license": "Apache-2.0"
 }

@@ -170,11 +170,16 @@ function buildRecord({ session, metrics, abstraction = {}, gitTruth = null, coac
     permission_mode: session.permissionMode,
     // coach feedback loop
     nudges_shown: coachNudges,
-    // git ground truth (numbers only)
+    // git ground truth (numbers only). survival_rate is null when nothing is
+    // scoreable (no window commits, or wholly superseded) so the team average
+    // ignores it rather than reading it as 0%. git_analyzed_at = when the
+    // deferred re-blame ran; day-0 records have no gitTruth -> pending.
     git_analyzed: !!(gitTruth && gitTruth.analyzed),
-    survival_rate: gitTruth ? gitTruth.survivalRate : 0,
+    survival_rate: gitTruth && gitTruth.analyzed ? gitTruth.survivalRate : 0,
     lines_surviving: gitTruth ? gitTruth.linesSurviving : 0,
+    lines_superseded: gitTruth ? (gitTruth.linesSuperseded || 0) : 0,
     reverts: gitTruth ? gitTruth.reverts : 0,
+    git_analyzed_at: gitTruth && gitTruth.analyzed ? gitTruth.analyzedAt : null,
     // A7/D2: classification provenance + versioned region profile.
     // classifier/extractor_version come from the abstraction (lib/extract.js
     // stamps both on every path — API success and deterministic fallback

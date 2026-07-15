@@ -610,9 +610,12 @@ function enforceRecordDetailed(raw, opts = {}) {
     nudges_shown: trackedEnumArray('nudges_shown', COACH_NUDGES),
     // Git ground truth (sender-computed numbers; no paths/messages).
     git_analyzed: !!r.git_analyzed,
-    survival_rate: clamp01(r.survival_rate),
+    survival_rate: r.survival_rate == null ? null : clamp01(r.survival_rate),
     lines_surviving: clampInt(r.lines_surviving),
+    lines_superseded: clampInt(r.lines_superseded),
     reverts: clampInt(r.reverts, 1000),
+    git_analyzed_at: Number.isFinite(Date.parse(r.git_analyzed_at))
+      ? new Date(r.git_analyzed_at).toISOString() : null,
     // A7/D2: classification provenance, trust tier, cost, and the versioned
     // region profile. classifier/trust_tier fail closed to the
     // no-independent-evidence defaults ('deterministic'/'self_reported') —
@@ -760,11 +763,15 @@ const SCHEMA_FIELDS = [
   { name: 'git_analyzed', type: 'bool',
     note: 'Whether git-based line-survival and revert analysis ran for this session; when false, survival_rate, lines_surviving, and reverts carry no meaningful signal.' },
   { name: 'survival_rate', type: 'float01',
-    note: 'Fraction of lines added during the session that still existed at measurement time, 0 to 1.' },
+    note: 'Fraction of scoreable lines (surviving + lost, i.e. excluding lines the same author later built on) still present at measurement time, 0 to 1; null when nothing is scoreable (no in-window commits, or all lines superseded).' },
   { name: 'lines_surviving', type: 'int',
     note: 'Count of added lines still present at measurement time, clamped to a non-negative integer.' },
+  { name: 'lines_superseded', type: 'int',
+    note: 'Count of the session\'s added lines later overwritten by the SAME author (built upon, not reverted); excluded from survival_rate, clamped to a non-negative integer.' },
   { name: 'reverts', type: 'int',
     note: 'Number of commits during the session that reverted prior work, clamped to a non-negative integer capped at 1000.' },
+  { name: 'git_analyzed_at', type: 'string',
+    note: 'ISO timestamp of when the deferred git re-blame ran for this session (null until it runs); lets surfaces show "measured N days after the session".' },
   { name: 'classifier', type: 'enum', enumRef: 'CLASSIFIERS',
     note: 'Which mechanism produced activity_category/domain for this record; falls back to \'deterministic\' if absent or not one of the listed values, since unknown provenance must never look like a model classified it.' },
   { name: 'extractor_version', type: 'string', shape: EXTRACTOR_VERSION_RE.source,

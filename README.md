@@ -1,25 +1,25 @@
-# Claudium — Claude Code usage plugin
+# Tokenomica — Claude Code usage plugin
 
-Claudium is a team dashboard for Claude Code usage: sessions, costs, prompt
+Tokenomica is a team dashboard for Claude Code usage: sessions, costs, prompt
 quality, burn rate, and coaching recommendations. This plugin uploads a
-privacy-scrubbed usage record to your team’s Claudium dashboard every time a
+privacy-scrubbed usage record to your team’s Tokenomica dashboard every time a
 Claude Code session ends.
 
 ## Install
 
 ```
 claude plugin marketplace add goverissimo/claudium-plugin
-claude plugin install claudium@claudium
+claude plugin install tokenomica@tokenomica
 ```
 
 ## Configure
 
-Sign in to your team’s Claudium dashboard, open **/connect**, claim your
+Sign in to your team’s Tokenomica dashboard, open **/connect**, claim your
 display name, and generate a token. Then write the config exactly as the
 page shows you:
 
 ```
-mkdir -p ~/.claudium && cat > ~/.claudium/plugin.json <<'EOF'
+mkdir -p ~/.tokenomica && cat > ~/.tokenomica/plugin.json <<'EOF'
 { "url": "https://your-dashboard.example.com", "token": "<your token>" }
 EOF
 ```
@@ -34,8 +34,8 @@ Without this file the plugin does nothing — it never blocks or fails a session
 
 ### Sharing tier
 
-One knob controls what this machine ships: `"tier"` in `~/.claudium/plugin.json`
-(or the `CLAUDIUM_TIER` environment variable, which overrides it). Five named
+One knob controls what this machine ships: `"tier"` in `~/.tokenomica/plugin.json`
+(or the `TOKENOMICA_TIER` environment variable, which overrides it). Five named
 tiers, each a strict superset of the one before it:
 
 | tier | usage records | session facts |
@@ -55,14 +55,14 @@ facts by default) — nothing silently narrows or widens on upgrade.
 Legacy config (no `tier` set, but you've historically relied on the sender's
 `BRAIN_USAGE` env var) still resolves, conservatively, to the nearest tier
 that ships no more than before, with a one-time warning naming the tier it
-picked; set `tier` explicitly to silence it. `/claudium:status` shows the
+picked; set `tier` explicitly to silence it. `/tokenomica:status` shows the
 resolved tier and its one-line meaning.
 
 ### Naming your projects
 
 By default each project ships under a `p-<12hex>` pseudonym: an HMAC of the
 derived project name (the last path segment), unique per machine. To ship a readable name instead, add a
-`project_labels` map to `~/.claudium/plugin.json`, keyed by the project name
+`project_labels` map to `~/.tokenomica/plugin.json`, keyed by the project name
 Claude Code derives internally (usually the last path segment of the
 project directory) and valued by the label you want it to ship as:
 
@@ -80,20 +80,20 @@ Nothing about your past sessions ever uploads on its own. The first time the
 plugin runs after setup with no import decision on record yet, it leaves a
 one-time note (best-effort, on stderr — Claude Code doesn't surface a
 SessionEnd hook's output to you, so don't expect to see it mid-session) and
-otherwise does nothing; `/claudium:status` is where the pending state
+otherwise does nothing; `/tokenomica:status` is where the pending state
 actually shows up.
 
-Run `/claudium:backfill` to import your existing session history now
+Run `/tokenomica:backfill` to import your existing session history now
 (deterministic labels only — see Classification below — and subject to your
 sharing tier: a tier below `metrics` ships nothing, and the command will say
 so rather than import anything). Prefer not to import it at all? Run
-`/claudium:backfill --skip` — that records your decision and stops the
+`/tokenomica:backfill --skip` — that records your decision and stops the
 notice for good, without uploading anything; you can still run
-`/claudium:backfill` for real at any later time.
+`/tokenomica:backfill` for real at any later time.
 
 ## Check it’s working
 
-Run `/claudium:status` inside Claude Code — it shows your config target,
+Run `/tokenomica:status` inside Claude Code — it shows your config target,
 whether history has imported (pending / done / skipped by you), and whether
 the server accepts your token.
 
@@ -127,10 +127,10 @@ call is — its own separate monthly credit, distinct from interactive Claude
 Code usage.
 
 Turn classification off entirely with `"classify": "off"` in
-`~/.claudium/plugin.json`, or set `"anthropic_api_key": "sk-…"` there to
+`~/.tokenomica/plugin.json`, or set `"anthropic_api_key": "sk-…"` there to
 classify via the direct API instead of your login. Cost accounting covers
 the headless (subscription) rung: each headless classification's cost is
-recorded locally, and `/claudium:status` shows the current mode, the last
+recorded locally, and `/tokenomica:status` shows the current mode, the last
 label produced, and the last classification's cost. API-key classification
 does not report cost yet — status shows 0 for it.
 

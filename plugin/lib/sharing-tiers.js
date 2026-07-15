@@ -73,7 +73,7 @@
 // "disable everything" knob (a running sender always shared AT LEAST
 // region-level live presence), so nothing already deployed can be silently
 // pushed all the way to 'off' by this mapping — 'off' is reachable only by
-// deliberately opting into it (config.tier: 'off' or CLAUDIUM_TIER=off), OR
+// deliberately opting into it (config.tier: 'off' or TOKENOMICA_TIER=off), OR
 // by an explicitly-provided tier value that ISN'T a valid tier name at all —
 // see the "explicit-but-invalid" handling in resolveTier below, which fails
 // CLOSED to 'off' rather than falling through to a less-restrictive source.
@@ -113,7 +113,7 @@ function normalizeTierName(name) {
   return TIER_NAMES.includes(lower) ? lower : null;
 }
 
-// One-line human-readable meaning of a tier, for /claudium:status and the
+// One-line human-readable meaning of a tier, for /tokenomica:status and the
 // sender boot log. An unrecognized name falls back to DEFAULT_TIER's
 // description rather than throwing or returning something empty — status
 // surfaces must always print SOMETHING sensible.
@@ -151,7 +151,7 @@ function resolveLegacyEnv(env) {
   return { tier, sharingLevel, usageOn };
 }
 
-// An explicitly-provided tier value (env.CLAUDIUM_TIER or config.tier is a
+// An explicitly-provided tier value (env.TOKENOMICA_TIER or config.tier is a
 // STRING, i.e. actually present) that doesn't match any tier name even
 // case-insensitively is a typo/misconfiguration, not "no opinion" — Review
 // fix (final whole-branch review, Important item 2): this fails CLOSED to
@@ -168,13 +168,13 @@ function invalidTierWarning(label, rawValue) {
 
 // resolveTier(config, env) -> { tier, source, flags, legacyWarning }
 //
-// Precedence: env.CLAUDIUM_TIER > config.tier > legacy envs (conservative
-// mapping, above) > DEFAULT_TIER. `config` is the parsed ~/.claudium/plugin.json
+// Precedence: env.TOKENOMICA_TIER > config.tier > legacy envs (conservative
+// mapping, above) > DEFAULT_TIER. `config` is the parsed ~/.tokenomica/plugin.json
 // object (or {}/null — tolerant of either); `env` is typically process.env,
 // but callers (sender.js) may pass a merged object to fold in CLI flags
 // (e.g. --sharing) ahead of the same-named env var.
 //
-// Each of CLAUDIUM_TIER/config.tier is matched case-insensitively against the
+// Each of TOKENOMICA_TIER/config.tier is matched case-insensitively against the
 // five tier names BEFORE being declared invalid ('Off' -> 'off', warning-
 // free) — only a value that matches NO tier name, in any case, is invalid.
 //
@@ -189,18 +189,24 @@ function invalidTierWarning(label, rawValue) {
 // The caller prints it ONCE at its own boot (a long-lived sender daemon boots
 // once; a short-lived plugin hook invocation IS its own boot, so printing
 // here each time it fires still satisfies "once per boot"). null whenever
-// CLAUDIUM_TIER, config.tier (both valid), or the pure default decided
+// TOKENOMICA_TIER, config.tier (both valid), or the pure default decided
 // instead — none of those owe a warning.
 function resolveTier(config, env) {
   const cfg = config || {};
   const e = env || {};
 
-  if (typeof e.CLAUDIUM_TIER === 'string') {
-    const normalized = normalizeTierName(e.CLAUDIUM_TIER);
+  // TOKENOMICA_TIER, falling back to the pre-rename CLAUDIUM_TIER so a hub or
+  // shell that set the old name keeps resolving exactly as before. The label
+  // in any warning names whichever var actually decided it.
+  const tierEnvName = typeof e.TOKENOMICA_TIER === 'string' ? 'TOKENOMICA_TIER'
+    : typeof e.CLAUDIUM_TIER === 'string' ? 'CLAUDIUM_TIER' : null;
+  if (tierEnvName) {
+    const raw = e[tierEnvName];
+    const normalized = normalizeTierName(raw);
     if (normalized) {
       return { tier: normalized, source: 'env', flags: TIERS[normalized], legacyWarning: null };
     }
-    return { tier: 'off', source: 'invalid-env', flags: TIERS.off, legacyWarning: invalidTierWarning('CLAUDIUM_TIER', e.CLAUDIUM_TIER) };
+    return { tier: 'off', source: 'invalid-env', flags: TIERS.off, legacyWarning: invalidTierWarning(tierEnvName, raw) };
   }
   if (typeof cfg.tier === 'string') {
     const normalized = normalizeTierName(cfg.tier);
@@ -215,7 +221,7 @@ function resolveTier(config, env) {
       tier: legacy.tier,
       source: 'legacy-env',
       flags: TIERS[legacy.tier],
-      legacyWarning: `legacy BRAIN_SHARING/BRAIN_USAGE env detected (sharing=${legacy.sharingLevel}, usage=${legacy.usageOn ? 'on' : 'off'}) — mapped conservatively to tier "${legacy.tier}". Set "tier" in ~/.claudium/plugin.json (or CLAUDIUM_TIER) to silence this warning.`,
+      legacyWarning: `legacy BRAIN_SHARING/BRAIN_USAGE env detected (sharing=${legacy.sharingLevel}, usage=${legacy.usageOn ? 'on' : 'off'}) — mapped conservatively to tier "${legacy.tier}". Set "tier" in ~/.tokenomica/plugin.json (or TOKENOMICA_TIER) to silence this warning.`,
     };
   }
   return { tier: DEFAULT_TIER, source: 'default', flags: TIERS[DEFAULT_TIER], legacyWarning: null };

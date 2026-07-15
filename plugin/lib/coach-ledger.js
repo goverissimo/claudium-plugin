@@ -3,34 +3,34 @@
 // showed, per session. This is the missing half of the feedback loop: the
 // hub sees the full session record, but only the coach knows a tip was
 // DISPLAYED. The ledger rides along when the session record is built
-// (`nudges_shown` enum list), so Claudium can measure tip adherence:
+// (`nudges_shown` enum list), so Tokenomica can measure tip adherence:
 // "sessions nudged about fail-streaks recover N% of the time".
 //
-// JSONL, append-only, ~/.claudium/coach-log.jsonl. Statuslines re-run every
+// JSONL, append-only, ~/.tokenomica/coach-log.jsonl. Statuslines re-run every
 // few seconds, so logNudge dedupes per session+kind within a window.
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
+const { configDir } = require('./config-dir');
 
 const DEDUP_MS = 10 * 60 * 1000;   // same nudge for same session: log 1x/10min
 const MAX_READ_BYTES = 2 * 1024 * 1024;
 
 // Task 15 item 1: classify_cost entries ride this SAME append-only ledger
 // file (one local file for "what did the coach show" AND "what did
-// classification cost" — /claudium:status reads the latter back). This
+// classification cost" — /tokenomica:status reads the latter back). This
 // reserved kind is NOT a nudge: nudgesFor (below) explicitly excludes it so
 // cost bookkeeping can never end up in a session's nudges_shown.
 const COST_KIND = 'classify_cost';
 
-// dir is the claudium dir the ledger lives in. No dir means the real
-// ~/.claudium — the shipping default. Callers that operate on an EXPLICIT
-// claudium dir (hermetic tests with a temp dir; the sender/plugin paths,
+// dir is the tokenomica dir the ledger lives in. No dir means the real
+// ~/.tokenomica — the shipping default. Callers that operate on an EXPLICIT
+// tokenomica dir (hermetic tests with a temp dir; the sender/plugin paths,
 // which already thread one for the salt) pass it through so the ledger read
 // stays inside that same dir and never touches the real home as a side
 // effect (Task 12 hermeticity fix).
 function defaultLedgerPath(dir) {
-  return path.join(dir || path.join(os.homedir(), '.claudium'), 'coach-log.jsonl');
+  return path.join(dir || configDir(), 'coach-log.jsonl');
 }
 
 function readEntries(file = null, { dir = null } = {}) {
@@ -72,8 +72,8 @@ function logNudge({ sessionId, kind, level, category }, { file = defaultLedgerPa
 }
 
 // nudgesFor(sessionId) -> unique kinds shown during that session, in order.
-// An explicit file wins; else dir picks the ledger inside that claudium dir;
-// else the real ~/.claudium (unchanged shipping default). classify_cost
+// An explicit file wins; else dir picks the ledger inside that tokenomica dir;
+// else the real ~/.tokenomica (unchanged shipping default). classify_cost
 // entries (see logClassifyCost below) are deliberately excluded here — this
 // function's contract is which NUDGES were shown, not every kind ever
 // logged, so cost bookkeeping can never ride along as a nudge.
@@ -110,7 +110,7 @@ function logClassifyCost({ sessionId, costUsd, classifier, activityCategory, dom
 }
 
 // lastClassifyCost({ dir, file }) -> the most recent classify_cost entry
-// across the WHOLE ledger (every session, not just one) — /claudium:status
+// across the WHOLE ledger (every session, not just one) — /tokenomica:status
 // (plugin/upload-session.js's runStatus) wants "the last classification that
 // ran", not one scoped to a single session id. null when none logged yet.
 function lastClassifyCost({ dir = null, file = null } = {}) {
