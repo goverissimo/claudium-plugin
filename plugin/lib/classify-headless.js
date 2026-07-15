@@ -34,6 +34,7 @@ const path = require('path');
 const { configDir } = require('./config-dir');
 const { ACTIVITY_CATEGORIES, DOMAINS, BUILTIN_TOOLS, scrubText, FACT_KEYS } = require('./scrub');
 const { extractAbstraction, fallbackAbstraction, EXTRACTOR_VERSION } = require('./extract');
+const { logClassifyError } = require('./coach-ledger');
 
 // Pinned deliberately (D4): comparable cross-org labels require ONE model, not
 // whatever the user happens to have configured interactively.
@@ -253,7 +254,23 @@ function classifyHeadless(digest, opts = {}) {
     spawnImpl = spawn,
     tokenomicaDir,
     env = process.env,
+    platform = process.platform,
   } = opts;
+
+  // On Windows the `claude` CLI is almost always a `.cmd`/`.ps1` shim (npm
+  // global) or needs PATHEXT resolution, and child_process.spawn() can't launch
+  // either without a shell — it throws ENOENT, which we used to swallow, so
+  // EVERY session on Windows silently fell back to the deterministic label
+  // ("metrics-only"). shell:true routes through cmd.exe, which resolves the
+  // shim and (modern Node) escapes the args. Safe here: the classify prompt
+  // rides stdin, not argv, and the only inline arg (--json-schema) is compact,
+  // space-free JSON with no cmd metacharacters beyond quotes.
+  const useShell = platform === 'win32';
+  // Best-effort trace so a failed spawn is visible in /tokenomica:status
+  // instead of masquerading as "not run yet".
+  const recordSpawnError = (e) => {
+    try { logClassifyError({ message: (e && e.message) || String(e) }, { dir: tokenomicaDir }); } catch { /* status is best-effort */ }
+  };
 
   return new Promise((resolve) => {
     let cwd;
@@ -277,6 +294,7 @@ function classifyHeadless(digest, opts = {}) {
     try {
       child = spawnImpl(claudeBin, args, {
         cwd,
+        shell: useShell,
         // Recursion guard #1 (see file header): TOKENOMICA_CLASSIFYING=1
         // propagates to this child's entire process tree, so any hook it
         // triggers on its own SessionEnd sees it too.
@@ -294,7 +312,8 @@ function classifyHeadless(digest, opts = {}) {
         // env var (PATH, ANTHROPIC_API_KEY, etc.) still passes through.
         env: Object.assign({}, stripEnrichEnv(env), { TOKENOMICA_CLASSIFYING: '1' }),
       });
-    } catch {
+    } catch (e) {
+      recordSpawnError(e);
       resolve(null);
       return;
     }
@@ -315,7 +334,7 @@ function classifyHeadless(digest, opts = {}) {
     if (typeof timer.unref === 'function') timer.unref();
 
     if (child.stdout) child.stdout.on('data', (c) => { stdout += c; });
-    child.on('error', () => finish(null));
+    child.on('error', (e) => { recordSpawnError(e); finish(null); });
     child.on('close', () => finish(parseHeadlessOutput(stdout)));
 
     try {

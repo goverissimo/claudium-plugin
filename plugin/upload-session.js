@@ -23,7 +23,7 @@ const { fallbackAbstraction } = require('./lib/extract');
 const { buildRecord } = require('./lib/record');
 const { getProjectName } = require('./lib/parse');
 const { loadSalt } = require('./lib/anonymize');
-const { lastClassifyCost } = require('./lib/coach-ledger');
+const { lastClassifyCost, lastClassifyError } = require('./lib/coach-ledger');
 // D4 (final review, item 1b): backfillAll's walk descends into EVERY project
 // dir under CLAUDE_DIR, including one derived from the classify() child's
 // own cwd (~/.tokenomica/classify) — buildFor must skip it explicitly, the
@@ -514,6 +514,14 @@ async function runStatus(fetchImpl = globalThis.fetch, { configPath = CONFIG_PAT
   console.log(last
     ? `last classification: ${last.activity_category || 'unknown'} · ${last.domain || 'unknown'} · $${Number(last.cost_usd || 0).toFixed(6)} (${last.classifier || 'unknown'})`
     : 'last classification: none yet');
+  // Surface a classify FAILURE that is more recent than the last success (or
+  // any failure if nothing has ever succeeded) — otherwise a broken classifier
+  // (e.g. the Windows spawn issue) just reads as "none yet"/stale success.
+  let err = null;
+  try { err = lastClassifyError({ dir: tokenomicaDir }); } catch { /* best-effort */ }
+  if (err && (!last || String(err.ts) > String(last.ts))) {
+    console.log(`classification error: ${err.message} (${err.ts}) — sessions ship metrics-only until this is fixed`);
+  }
   let res;
   try {
     const r = await post(String(cfg.url).replace(/\/+$/, ''), '/api/records', cfg.token, {}, fetchImpl);

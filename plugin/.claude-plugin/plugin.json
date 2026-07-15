@@ -1,7 +1,7 @@
 {
   "name": "tokenomica",
   "description": "Uploads privacy-scrubbed Claude Code usage records to your team's Tokenomica dashboard when a session ends. Raw transcripts never leave your machine.",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "author": { "name": "Tokenomica" },
   "license": "Apache-2.0"
 }

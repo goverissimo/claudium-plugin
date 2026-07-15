@@ -22,6 +22,12 @@ const MAX_READ_BYTES = 2 * 1024 * 1024;
 // reserved kind is NOT a nudge: nudgesFor (below) explicitly excludes it so
 // cost bookkeeping can never end up in a session's nudges_shown.
 const COST_KIND = 'classify_cost';
+// Same append-only ledger, one more reserved non-nudge kind: a classification
+// that was ATTEMPTED but failed to run (e.g. the headless `claude` spawn errored
+// — a real, silent-until-now failure mode on Windows where `claude` is a .cmd
+// shim). /tokenomica:status surfaces the most recent one so a stuck classifier
+// stops looking like "just hasn't run yet". Excluded from nudgesFor like COST_KIND.
+const ERROR_KIND = 'classify_error';
 
 // dir is the tokenomica dir the ledger lives in. No dir means the real
 // ~/.tokenomica — the shipping default. Callers that operate on an EXPLICIT
@@ -80,7 +86,7 @@ function logNudge({ sessionId, kind, level, category }, { file = defaultLedgerPa
 function nudgesFor(sessionId, { dir = null, file = null } = {}) {
   const kinds = [];
   for (const e of readEntries(file, { dir })) {
-    if (e.session_id === sessionId && e.kind && e.kind !== COST_KIND && !kinds.includes(e.kind)) kinds.push(e.kind);
+    if (e.session_id === sessionId && e.kind && e.kind !== COST_KIND && e.kind !== ERROR_KIND && !kinds.includes(e.kind)) kinds.push(e.kind);
   }
   return kinds;
 }
@@ -121,4 +127,29 @@ function lastClassifyCost({ dir = null, file = null } = {}) {
   return null;
 }
 
-module.exports = { logNudge, nudgesFor, logClassifyCost, lastClassifyCost, readEntries, defaultLedgerPath, DEDUP_MS };
+// logClassifyError({ message }, { dir, file }) -> true if written. Called by
+// lib/classify-headless.js when the headless classify spawn errors, so a
+// failure leaves a trace instead of silently degrading to the deterministic
+// guess. Message is a short reason string (e.g. the spawn error message) —
+// no session data.
+function logClassifyError({ message }, { dir = null, file = null, nowMs = Date.now() } = {}) {
+  const target = file || defaultLedgerPath(dir);
+  const entry = { ts: new Date(nowMs).toISOString(), kind: ERROR_KIND, message: String(message || 'unknown').slice(0, 300) };
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.appendFileSync(target, JSON.stringify(entry) + '\n');
+    return true;
+  } catch { return false; }
+}
+
+// lastClassifyError({ dir, file }) -> the most recent classify_error entry, or
+// null. Used by /tokenomica:status to show a stuck/failing classifier.
+function lastClassifyError({ dir = null, file = null } = {}) {
+  const entries = readEntries(file, { dir });
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i] && entries[i].kind === ERROR_KIND) return entries[i];
+  }
+  return null;
+}
+
+module.exports = { logNudge, nudgesFor, logClassifyCost, lastClassifyCost, logClassifyError, lastClassifyError, readEntries, defaultLedgerPath, DEDUP_MS };
