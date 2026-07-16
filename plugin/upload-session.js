@@ -10,6 +10,16 @@
 // { "url": "https://…", "token": "…" }
 // (a stale "transcripts" key from an older config is silently ignored.)
 //
+// GRACE WINDOW: Claude Code aborts SessionEnd hooks — and their whole process
+// tree — roughly 1.5s after session end, regardless of hooks.json's own
+// timeout ("Hook cancelled"; verified against Claude Code 2.1.211; the
+// CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS override exists but users won't set
+// it). A hook that exits fast is never cancelled, and ONLY then does a
+// detached child escape the tree kill. So runHook does nothing but read its
+// stdin input and spawn plugin/finish-session.js fully detached; ALL real
+// work (upload, enrich spawn, backfill notice, resurvey — runFinish below)
+// happens in that child, after this process and the CLI are already gone.
+//
 // Self-contained: requires ONLY ./lib (vendored by scripts/build-plugin.js)
 // and Node built-ins. No npm install.
 
@@ -47,6 +57,9 @@ const { resurveyAged } = require('./lib/resurvey');
 // spawnEnrich below, requiring only ./lib (vendored) so it's vendor-safe
 // exactly like this file.
 const ENRICH_SCRIPT = path.join(__dirname, 'enrich-session.js');
+// The detached SessionEnd finisher (see GRACE WINDOW above) — a thin shim
+// that calls this file's own runFinish. Same vendor-safe contract.
+const FINISH_SCRIPT = path.join(__dirname, 'finish-session.js');
 
 const CONFIG_PATH = path.join(configDir(), 'plugin.json');
 const CLAUDE_DIR = process.env.CLAUDE_DIR || path.join(os.homedir(), '.claude', 'projects');
@@ -183,10 +196,11 @@ async function uploadOne(filepath, claudeDir, cfg, fetchImpl = globalThis.fetch)
 // ignored, so no pipe is available) — TOKENOMICA_ENRICH_* below is the whole
 // contract; plugin/enrich-session.js's optsFromEnv reads the same names.
 //
-// Recursion note: this is reachable ONLY from within runHook, which has
-// already returned early if TOKENOMICA_CLASSIFYING is set on ITS OWN env (see
-// runHook below) — so this never fires from inside a classify child's own
-// SessionEnd. The env passed to the CHILD here is never given
+// Recursion note: this is reachable ONLY from within runFinish (via
+// uploadAndEnrich), and the finisher itself is only ever spawned by runHook,
+// which has already returned early if TOKENOMICA_CLASSIFYING is set on ITS
+// OWN env (see runHook below) — so this never fires from inside a classify
+// child's own SessionEnd. The env passed to the CHILD here is never given
 // TOKENOMICA_CLASSIFYING itself; only classifyHeadless()'s OWN spawned
 // `claude -p` (a grandchild, deep inside the enrichment child) gets that.
 function spawnEnrich(fp, claudeDir, cfg, { spawnImpl = spawn } = {}) {
@@ -243,36 +257,90 @@ function readStdinJson() {
   });
 }
 
+// Spawns plugin/finish-session.js FULLY DETACHED (same mechanics as
+// spawnEnrich above: detached + stdio 'ignore' + unref, env-var contract
+// because no pipe exists). The hook exits the instant this returns; the
+// finisher — reparented to init once the hook is gone — does all the real
+// session-end work on its own, outside the CLI's ~1.5s grace window (see
+// GRACE WINDOW in the file header). Only filepath/claudeDir cross the
+// boundary: the finisher loads ~/.tokenomica/plugin.json itself, so config
+// never rides through the environment.
+function spawnFinish(fp, claudeDir, { spawnImpl = spawn } = {}) {
+  try {
+    const child = spawnImpl(process.execPath, [FINISH_SCRIPT], {
+      cwd: __dirname,
+      detached: true,
+      stdio: 'ignore',
+      env: Object.assign({}, process.env, {
+        TOKENOMICA_FINISH_FILE: fp || '',
+        TOKENOMICA_FINISH_CLAUDE_DIR: claudeDir,
+      }),
+    });
+    if (child && typeof child.unref === 'function') child.unref();
+    return child;
+  } catch (e) {
+    console.error(`tokenomica: finish spawn failed: ${e.message}`);
+    return null;
+  }
+}
+
+// The SessionEnd hook itself. It must finish in well under the CLI's ~1.5s
+// grace window or it is cancelled AND its process tree is killed — so it
+// does no network, git, or transcript work at all: guard, load config, read
+// the hook input, spawn the detached finisher, exit. Testability seams
+// (opts.configPath, opts.input, opts.spawnImpl) exist because stdin/config
+// are otherwise process-global; production callers pass nothing.
 async function runHook(opts = {}) {
   // D4 recursion guard: lib/classify-headless.js spawns `claude -p` as a
   // child with TOKENOMICA_CLASSIFYING=1 in its env (inherited down that
   // child's whole process tree). If THIS SessionEnd hook fires again for
   // that child's own session, bail out immediately — never sessionize or
   // classify the classifier's own transcript, or the recursion never ends.
-  // This also means uploadAndEnrich/spawnEnrich below are NEVER reached from
-  // inside a classify child's own SessionEnd — the guard is upstream of them.
+  // The guard sits HERE, not in the finisher: the finisher inherits this
+  // process's env, so a classify child's SessionEnd never spawns one at all.
   if (process.env.TOKENOMICA_CLASSIFYING) return;
-  const cfg = loadConfig();
+  const cfg = loadConfig(opts.configPath);
   if (!cfg) { console.error('tokenomica: no config — run the connect setup from /connect first'); return; }
+  const input = opts.input !== undefined ? opts.input : await readStdinJson();
+  const fp = (input && input.transcript_path) || '';
+  spawnFinish(fp, CLAUDE_DIR, opts);
+}
+
+// The old runHook body — everything session end actually owes — now run by
+// the detached finisher (plugin/finish-session.js), which nothing is
+// waiting on: upload the deterministic day-0 record, spawn the enrichment
+// child, surface the one-time backfill notice, drain a little resurvey
+// backlog. Every injectable (configPath/tokenomicaDir/fetchImpl/spawnImpl/
+// markerFile/noticeFile/ledgerPath) defaults to the real thing; tests pass
+// temp paths so nothing here ever touches real state under test.
+async function runFinish({ filepath = '', claudeDir = CLAUDE_DIR, configPath = CONFIG_PATH,
+  tokenomicaDir, fetchImpl = globalThis.fetch, spawnImpl = spawn,
+  markerFile, noticeFile, ledgerPath } = {}) {
+  let cfg = loadConfig(configPath);
+  if (!cfg) { console.error('tokenomica: no config — run the connect setup from /connect first'); return; }
+  if (tokenomicaDir) cfg = Object.assign({}, cfg, { tokenomicaDir });
   // Task 24 (G3): a legacy BRAIN_SHARING/BRAIN_USAGE env resolved the tier
   // conservatively rather than an explicit tier/TOKENOMICA_TIER — warn once.
-  // Each SessionEnd hook invocation is itself a fresh, short-lived process,
-  // so printing here satisfies "once per boot" the same way the sender
+  // Each finisher invocation is itself a fresh, short-lived process, so
+  // printing here satisfies "once per boot" the same way the sender
   // daemon's single boot-time print does.
   if (cfg.legacyWarning) console.error(`tokenomica: ${cfg.legacyWarning}`);
-  const input = await readStdinJson();
-  const fp = input && input.transcript_path;
   // Task 14 item 1: POST immediately with deterministic labels (uploadOne,
   // inside uploadAndEnrich), then — only if that landed and classify isn't
-  // turned off — spawn the fully detached enrichment child. Either way this
-  // hook exits 0 right after, never having waited on an LLM.
-  if (fp) await uploadAndEnrich(fp, CLAUDE_DIR, cfg, opts);
+  // turned off — spawn the fully detached enrichment child.
+  if (filepath) await uploadAndEnrich(filepath, claudeDir, cfg, { fetchImpl, spawnImpl });
   else console.error('tokenomica: hook input had no transcript_path');
-  try { await maybeAutoBackfill(cfg); }
+  const backfillOpts = {};
+  if (markerFile) backfillOpts.markerFile = markerFile;
+  if (noticeFile) backfillOpts.noticeFile = noticeFile;
+  try { await maybeAutoBackfill(cfg, backfillOpts); }
   catch (e) { console.error(`tokenomica: auto-backfill: ${e.message}`); }
   // Deferred code-survival: re-blame a few aged sessions. Best-effort and
-  // capped — session end must never block on it.
-  try { await runResurvey(cfg, CLAUDE_DIR, { maxPerRun: 3 }); } catch {}
+  // capped — each finisher run stays short; the per-session ledger
+  // (lib/resurvey.js) makes progress durable even if this process dies.
+  const resurveyOpts = { maxPerRun: 3, fetchImpl };
+  if (ledgerPath) resurveyOpts.ledgerPath = ledgerPath;
+  try { await runResurvey(cfg, claudeDir, resurveyOpts); } catch {}
 }
 
 async function backfillAll(cfg, claudeDir = CLAUDE_DIR, fetchImpl = globalThis.fetch) {
@@ -341,9 +409,9 @@ function saveResurveyLedger(ids, ledgerPath = RESURVEY_LEDGER) {
 // re-POSTs; the hub upserts over the day-0 record in place. Gated by the
 // SAME usage flag every other shipping route funnels through (effectiveFlags)
 // so a non-shipping tier never re-blames OR re-uploads anything.
-// maxPerRun is small (3) from the SessionEnd hook (never hang session end)
-// and large from the explicit /tokenomica:resurvey command (drains the
-// backlog on demand). ledgerPath defaults to the real RESURVEY_LEDGER —
+// maxPerRun is small (3) from the session-end finisher (each run stays
+// short) and large from the explicit /tokenomica:resurvey command (drains
+// the backlog on demand). ledgerPath defaults to the real RESURVEY_LEDGER —
 // tests override it (same injectable pattern as runBackfill's markerFile).
 async function runResurvey(cfg, claudeDir = CLAUDE_DIR, { maxPerRun = 3, fetchImpl = globalThis.fetch, ledgerPath = RESURVEY_LEDGER } = {}) {
   const flags = effectiveFlags(cfg);
@@ -530,8 +598,8 @@ async function runStatus(fetchImpl = globalThis.fetch, { configPath = CONFIG_PAT
   console.log(`server: ${classifyProbe(res)}`);
 }
 
-module.exports = { loadConfig, buildFor, uploadOne, uploadAndEnrich, spawnEnrich, runHook, runBackfill,
-  backfillAll, maybeAutoBackfill, runStatus, classifyProbe, runResurvey, runResurveyCommand, CONFIG_PATH, MARKER_PATH };
+module.exports = { loadConfig, buildFor, uploadOne, uploadAndEnrich, spawnEnrich, spawnFinish, runHook, runFinish,
+  runBackfill, backfillAll, maybeAutoBackfill, runStatus, classifyProbe, runResurvey, runResurveyCommand, CONFIG_PATH, MARKER_PATH };
 
 if (require.main === module) {
   // Task 25 (G4): --skip travels alongside --backfill (the /tokenomica:backfill

@@ -27,8 +27,9 @@
 // file header): classify() may spawn `claude -p` with TOKENOMICA_CLASSIFYING=1
 // set on THAT child's env — a grandchild relative to the original hook,
 // never on THIS process's own env. This process itself is not given
-// TOKENOMICA_CLASSIFYING (spawnEnrich never sets it, and runHook never spawns
-// this script while that guard is active in the first place); if it
+// TOKENOMICA_CLASSIFYING (spawnEnrich never sets it, and runHook — which
+// gates the whole finisher chain that reaches spawnEnrich — never runs
+// while that guard is active in the first place); if it
 // somehow were set anyway, classifyHeadless's own belt-and-braces guard
 // refuses to spawn again regardless (see lib/classify-headless.js).
 //

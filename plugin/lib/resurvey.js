@@ -12,7 +12,11 @@
 //
 // A ledger of surveyed session ids (host-supplied load/save) means each aged
 // session is re-blamed once, not on every trigger; a session is ledgered even
-// when it had no commits, so it is never re-examined.
+// when it had no commits, so it is never re-examined. The ledger is written
+// after EACH session, not once at the end of the batch: the plugin route runs
+// in a process that can be killed at any moment (the CLI aborts session-end
+// work on shutdown), and an end-of-batch write would lose every finished
+// session on such a kill — the backlog would never converge.
 
 const DAY_MS = 86400000;
 
@@ -29,16 +33,16 @@ async function resurveyAged({ listSessions, buildOne, post, loadLedger, saveLedg
     .slice(0, maxPerRun);
 
   let surveyed = 0, skipped = 0;
-  const done = new Set();
   for (const s of due) {
     try {
       const built = await buildOne(s.file);
       const record = built && built.record ? built.record : built;
       if (record) { await post(record); surveyed++; } else { skipped++; }
-      done.add(s.id);   // ledger even a null build so a commit-less session isn't retried
+      // Persist immediately — ledger even a null build so a commit-less
+      // session isn't retried, and never defer to end-of-batch (see header).
+      saveLedger(new Set([s.id]));
     } catch { skipped++; /* transient (repo moved, git error) — retry next run, do not ledger */ }
   }
-  if (done.size) saveLedger(done);
   return { surveyed, skipped };
 }
 
