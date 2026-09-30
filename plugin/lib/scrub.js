@@ -28,8 +28,21 @@ const PROMPT_ANTIPATTERNS = [
   'vague_goal', 'no_success_criteria', 'missing_context',
   'scope_creep', 'correction_loop', 'kitchen_sink',
 ];
+// What each typed message DID (lib/prompt-kind.js). Shipped as per-kind
+// counts only — never the text.
+const { PROMPT_KINDS } = require('./prompt-kind');
 const PERMISSION_MODES = ['default', 'plan', 'acceptEdits', 'bypassPermissions', 'unknown'];
 const COACH_NUDGES = ['fail_streak', 'denials', 'frustration', 'correction_loop', 'rework', 'over_baseline'];
+
+// Tasks (lib/task-path.js): one per message that started work or reported a
+// bug, with how it ENDED. Enums + ints only; prompt_index never ships.
+const { TASK_PATHS, TASK_ENDINGS, VERIFICATIONS } = require('./task-path');
+const GIT_CHECKPOINTS = ['d7', 'd30'];
+const GIT_BASES = ['origin', 'local', 'none'];
+const GIT_LANDED_VIA = ['ancestor', 'patch_id', 'squash', 'lines', 'none'];
+const GIT_REPLACED = ['fix', 'revert', 'neutral', 'rework'];
+const TASK_KINDS = ['start', 'bug'];
+const TASKS_CAP = 50;
 
 // A7/D2: which mechanism produced activity_category/domain for this record.
 // 'haiku_headless' is stamped by PR2's local headless-model module (not built
@@ -117,6 +130,10 @@ const composeIntentSummary = (category, domain) => `${category} · ${domain}`;
 // text. Hashing/sanitizing happens upstream in record assembly (lib/record.js);
 // this gate just enforces the shape and rejects anything else to ''.
 const PROJECT_LABEL_RE = /^(p-[a-f0-9]{12}|[a-z0-9][a-z0-9._-]{0,39})$/;
+
+// usage.speed: which billing speed the request ran at. 'fast' is the same
+// model at a premium rate, so this is a cost input rather than telemetry.
+const SPEEDS = ['standard', 'fast', 'unknown'];
 
 // Secrets — aggressive on purpose: a false positive only redacts harmless text.
 const SECRET_PATTERNS = [
@@ -290,6 +307,122 @@ const regionCountsOrZeros = (v) => {
   return out;
 };
 
+// prompt_kinds: same treatment as region_counts — exactly PROMPT_KINDS as
+// keys, non-negative ints, unknown keys dropped, missing keys 0. A session
+// cannot have more typed messages than turns, so 5000 is generous headroom.
+const PROMPT_KIND_MAX = 5000;
+const promptKindsOrZeros = (v) => {
+  const src = v && typeof v === 'object' ? v : {};
+  const out = {};
+  for (const k of PROMPT_KINDS) out[k] = clampInt(src[k], PROMPT_KIND_MAX);
+  return out;
+};
+
+// git_outcome (lib/git-manifest.js measureManifest): null until the day-7 or
+// day-30 survey. Rebuilt key by key from fixed lists — anything not named
+// here is dropped, so a path, SHA or subject can never ride along.
+const GIT_INT_MAX = 1000000;
+const countMap = (src, keys) => Object.fromEntries(keys.map(k => [k, clampInt(src && src[k], GIT_INT_MAX)]));
+const gitOutcomeOrNull = (v) => {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  if (!GIT_CHECKPOINTS.includes(v.checkpoint)) return null;
+  const tasks = [];
+  const seen = new Set();
+  for (const t of Array.isArray(v.tasks) ? v.tasks : []) {
+    if (!t || !Number.isInteger(t.index) || t.index < 0 || t.index >= TASKS_CAP || seen.has(t.index)) continue;
+    seen.add(t.index);
+    tasks.push({ index: t.index, ...countMap(t, ['commits', 'commits_landed', 'commits_reverted', 'lines', 'survived', 'fixed']) });
+    if (tasks.length === TASKS_CAP) break;
+  }
+  return {
+    v: 1, checkpoint: v.checkpoint, age_days: clampInt(v.age_days, 3650),
+    base: oneOf(v.base, GIT_BASES, 'none'), fetched_after_session: v.fetched_after_session === true,
+    ...countMap(v, ['commits', 'commits_from_transcript', 'commits_landed', 'commits_reverted', 'lines', 'survived',
+      'changed_self', 'changed_other', 'files_skipped', 'lines_unmapped']),
+    landed_via: countMap(v.landed_via, GIT_LANDED_VIA),
+    replaced_by: countMap(v.replaced_by, GIT_REPLACED),
+    first_fix_days: v.first_fix_days == null ? null : clampInt(v.first_fix_days, 3650),
+    truncated: v.truncated === true,
+    tasks,
+  };
+};
+
+// skills_used / mcp_servers_used: [{ name, calls }]. A name is either a
+// public, lowercase plugin/skill/server name or 'h:<12 hex>' (keyed hash of a
+// private one, lib/extensions.js). Anything else is dropped.
+const EXT_NAME_RE = /^(?:[a-z0-9][a-z0-9._:-]{0,79}|h:[a-f0-9]{12})$/;
+const extensionCallsOrEmpty = (v, cap = 20) => {
+  if (!Array.isArray(v)) return [];
+  const out = new Map();
+  for (const x of v) {
+    if (!x || typeof x.name !== 'string' || !EXT_NAME_RE.test(x.name)) continue;
+    const calls = clampInt(x.calls, 100000);
+    if (!calls) continue;
+    out.set(x.name, (out.get(x.name) || 0) + calls);
+  }
+  return [...out].map(([name, calls]) => ({ name, calls })).slice(0, cap);
+};
+const REBUILD_CAUSES = ['start', 'idle_over_1h', 'idle_5_to_60m', 'model_switch', 'other'];
+const cacheRebuildsOrNull = (v) => {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  const by = {};
+  for (const k of REBUILD_CAUSES) {
+    const c = v.by_cause && v.by_cause[k];
+    by[k] = { count: clampInt(c && c.count, 100000), tokens: clampInt(c && c.tokens) };
+  }
+  const usd = Number(v.avoidable_usd);
+  const share = Number(v.share_5m);
+  const t = v.avoidable_tokens && typeof v.avoidable_tokens === 'object' ? v.avoidable_tokens : null;
+  // avoidable_usd is capped (no single session's rebuilds cost $10k) and the
+  // server re-derives it from avoidable_tokens anyway (lib/price-book.js).
+  return { by_cause: by,
+    ...(t ? { avoidable_tokens: { '5m': clampInt(t['5m']), '1h': clampInt(t['1h']) } } : {}),
+    avoidable_usd: Number.isFinite(usd) && usd > 0 ? Math.min(10000, Math.round(usd * 100) / 100) : 0,
+    share_5m: Number.isFinite(share) ? Math.min(1, Math.max(0, Math.round(share * 1000) / 1000)) : 0 };
+};
+const LIMIT_KINDS = ['weekly', 'session', 'model', 'spend', 'other'];
+const limitHitsOrZeros = (v) => countMap(v && typeof v === 'object' ? v : {}, LIMIT_KINDS);
+// branch_key: 'b-' + 12 hex (keyed hash). git_branch: only when the org has
+// turned on sharing git refs; a plain branch name, no slashes-traversal junk.
+const BRANCH_KEY_RE = /^b-[a-f0-9]{12}$/;
+const GIT_BRANCH_RE = /^[A-Za-z0-9._\/-]{1,80}$/;
+const COMMIT_ID_RE = /^[0-9a-f]{7,12}$/;
+
+// tasks: each entry must be well-formed or it is dropped (a task is a unit of
+// meaning, so a half-valid one is worse than none). Counts clamp like every
+// other int; messages is a PROMPT_KINDS-keyed count map like prompt_kinds.
+const TASK_COUNT_MAX = 5000;
+const tasksOrEmpty = (v) => {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  const seenIndexes = new Set();
+  for (const t of v) {
+    if (!t || typeof t !== 'object') continue;
+    if (!TASK_KINDS.includes(t.kind) || !TASK_PATHS.includes(t.path) || !TASK_ENDINGS.includes(t.ended_with)) continue;
+    // index must be a genuine non-negative integer under the cap, and unique
+    // among kept tasks — later code looks tasks up by index, so a coerced or
+    // colliding index is worse than no task at all: drop it like any other
+    // invalid field, rather than coercing two raw tasks onto one slot.
+    if (!Number.isInteger(t.index) || t.index < 0 || t.index >= TASKS_CAP || seenIndexes.has(t.index)) continue;
+    seenIndexes.add(t.index);
+    out.push({
+      index: t.index,
+      kind: t.kind, path: t.path, ended_with: t.ended_with,
+      messages: promptKindsOrZeros(t.messages),
+      tests: clampInt(t.tests, TASK_COUNT_MAX),
+      errors: clampInt(t.errors, TASK_COUNT_MAX),
+      commits: clampInt(t.commits, TASK_COUNT_MAX),
+      // Older senders don't send these: 'unknown' / false, never a drop.
+      verification: oneOf(t.verification, VERIFICATIONS, 'unknown'),
+      target_hint: t.target_hint === true,
+      // Present only when the org turned on sharing git refs (lib/record.js).
+      ...(Array.isArray(t.commit_ids) ? { commit_ids: [...new Set(t.commit_ids.filter(x => typeof x === 'string' && COMMIT_ID_RE.test(x)))].slice(0, 20) } : {}),
+    });
+    if (out.length === TASKS_CAP) break;
+  }
+  return out;
+};
+
 const SKEW_MS = 15 * 60 * 1000; // clock-skew tolerance for "now" bounds checks
 
 // Fold-forward from PR1's final review (hub-side unbounded-past started_at
@@ -345,7 +478,9 @@ const ENUM_MEMBERS = new Set([
   ...ACTIVITY_CATEGORIES, ...DOMAINS, ...TECHNIQUES, ...OUTCOMES,
   ...FRICTION_REASONS, ...SATISFACTIONS, ...SERVICE_TIERS, ...PROMPT_ANTIPATTERNS,
   ...PERMISSION_MODES, ...COACH_NUDGES, ...BUILTIN_TOOLS, ...CLASSIFIERS,
-  ...TRUST_TIERS, ...REGION_KEYS, ...FACT_KEYS,
+  ...TRUST_TIERS, ...REGION_KEYS, ...FACT_KEYS, ...PROMPT_KINDS,
+  ...TASK_PATHS, ...TASK_ENDINGS, ...TASK_KINDS, ...VERIFICATIONS,
+  ...GIT_CHECKPOINTS, ...GIT_BASES, ...GIT_LANDED_VIA, ...GIT_REPLACED,
 ]);
 // D1a (Task 16): session_facts[].v, when it's a string, is CONSTRAINED free
 // text — the one deliberate exception to this file's enum-only shape
@@ -379,8 +514,20 @@ const STANDARD_SHAPES = [
   { name: 'iso_minute', regex: /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00\.000Z$/ },
   { name: 'composed_intent', regex: /^[a-z_]+ · [a-z_]+$/ },
   { name: 'region_taxonomy', test: (s) => s === REGION_TAXONOMY },
+  { name: 'branch_key', regex: BRANCH_KEY_RE },
   { name: 'empty', test: (s) => s === '' },
 ];
+// Shapes allowed ONLY on the named field (the final gate checks them by field
+// name, never globally): an extension name is a lowercase plugin/skill/server
+// name or 'h:' + keyed hash; a branch name and short commit ids appear only
+// when an org opted in to sharing git refs. Global scope would let a path or
+// free text through on any field that happens to share the shape.
+const FIELD_SHAPES = {
+  'skills_used.name': EXT_NAME_RE,
+  'mcp_servers_used.name': EXT_NAME_RE,
+  'git_branch': GIT_BRANCH_RE,
+  'tasks.commit_ids': COMMIT_ID_RE,
+};
 // Table-driven and exported: Task 11's schema dictionary consumes this FULL
 // list (including fact_value) directly instead of re-deriving shape rules
 // from scattered per-field regexes — it documents every shape ANY value in
@@ -394,6 +541,7 @@ function assertShapes(record) {
   const dropped = [];
   const check = (field, s) => {
     if (matchesAnyShape(s)) return s;
+    if (FIELD_SHAPES[field] && FIELD_SHAPES[field].test(s)) return s;
     dropped.push({ field, shape: 'none' });
     return '';
   };
@@ -418,6 +566,27 @@ function assertShapes(record) {
         // property would silently inherit the free-text exception. Exactly
         // ONE field in the whole record is permitted short constrained free
         // text, by name.
+        // tasks: array of task objects, scoped by FIELD NAME like
+        // session_facts above (never by guessing from a key such as `path`).
+        // Build a NEW object per task — the caller's record is never
+        // mutated — and check EVERY string value on it (not just the
+        // kind/path/ended_with enums: an unexpected extra field must not
+        // slip through), plus messages' KEYS like the region_counts object
+        // branch below (and any string-valued message count).
+        if (field === 'tasks' && v && typeof v === 'object') {
+          const t = {};
+          for (const [k, vv] of Object.entries(v)) {
+            if (k === 'messages' && vv && typeof vv === 'object' && !Array.isArray(vv)) {
+              const m = {};
+              for (const [mk, mv] of Object.entries(vv)) {
+                m[check(`${field}.messages.${mk}`, mk)] = typeof mv === 'string' ? check(`${field}.messages.${mk}`, mv) : mv;
+              }
+              t.messages = m;
+            } else if (Array.isArray(vv)) t[k] = vv.map((x) => (typeof x === 'string' ? check(`${field}.${k}`, x) : x));
+            else t[k] = typeof vv === 'string' ? check(`${field}.${k}`, vv) : vv;
+          }
+          return t;
+        }
         if (v && typeof v === 'object') {
           const o = {};
           for (const [k, vv] of Object.entries(v)) {
@@ -430,6 +599,20 @@ function assertShapes(record) {
         }
         return v;
       });
+    }
+    else if (field === 'git_outcome' && value && typeof value === 'object') {
+      // Every string anywhere inside must be an allowed shape; keys too.
+      const walk = (v, where) => {
+        if (typeof v === 'string') return check(where, v);
+        if (Array.isArray(v)) return v.map((x, i) => walk(x, `${where}.${i}`));
+        if (v && typeof v === 'object') {
+          const o = {};
+          for (const [k, vv] of Object.entries(v)) o[check(`${where}.${k}`, k)] = walk(vv, `${where}.${k}`);
+          return o;
+        }
+        return v;
+      };
+      out[field] = walk(value, field);
     }
     else if (value && typeof value === 'object') {
       // region_counts: only the KEYS are string surface (values are ints,
@@ -581,6 +764,15 @@ function enforceRecordDetailed(raw, opts = {}) {
     input_tokens: clampInt(r.input_tokens),
     cache_read_tokens: clampInt(r.cache_read_tokens),
     cache_creation_tokens: clampInt(r.cache_creation_tokens),
+    // The 5m/1h cache-write split. Billed at DIFFERENT rates (1.25x vs 2x the
+    // base input price), so collapsing them — as cache_creation_tokens above
+    // does — under-prices the largest cost component of a typical Claude Code
+    // session by ~60%. Zero from clients that predate the split; the server's
+    // price book falls back to the flat total in that case.
+    cache_creation_5m_tokens: clampInt(r.cache_creation_5m_tokens),
+    cache_creation_1h_tokens: clampInt(r.cache_creation_1h_tokens),
+    // Fast mode is the same model at a premium rate, so it is a pricing input.
+    speed: trackedOneOf('speed', SPEEDS, 'unknown'),
     cache_hit_ratio: clamp01(r.cache_hit_ratio),
     est_cost_usd: nonNegFloat(r.est_cost_usd),
     service_tier: trackedOneOf('service_tier', SERVICE_TIERS, 'unknown'),
@@ -597,6 +789,11 @@ function enforceRecordDetailed(raw, opts = {}) {
     // Prompt quality (enum + score only — never the prompt text).
     prompt_antipatterns: trackedEnumArray('prompt_antipatterns', PROMPT_ANTIPATTERNS),
     prompt_quality: clamp01(r.prompt_quality),
+    prompt_kinds: promptKindsOrZeros(r.prompt_kinds),
+    // how each task ended (lib/task-path.js) — enums + counts; prompt_index
+    // is local-only and never reaches here (lib/record.js strips it first)
+    tasks: tasksOrEmpty(r.tasks),
+    task_count: clampInt(r.task_count, TASK_COUNT_MAX),
     // Task threading inputs.
     is_continuation: !!r.is_continuation,
     compactions: clampInt(r.compactions, 1000),
@@ -616,6 +813,13 @@ function enforceRecordDetailed(raw, opts = {}) {
     reverts: clampInt(r.reverts, 1000),
     git_analyzed_at: Number.isFinite(Date.parse(r.git_analyzed_at))
       ? new Date(r.git_analyzed_at).toISOString() : null,
+    git_outcome: gitOutcomeOrNull(r.git_outcome),
+    skills_used: extensionCallsOrEmpty(r.skills_used),
+    mcp_servers_used: extensionCallsOrEmpty(r.mcp_servers_used),
+    cache_rebuilds: cacheRebuildsOrNull(r.cache_rebuilds),
+    limit_hits: limitHitsOrZeros(r.limit_hits),
+    branch_key: typeof r.branch_key === 'string' && BRANCH_KEY_RE.test(r.branch_key) ? r.branch_key : '',
+    git_branch: typeof r.git_branch === 'string' && GIT_BRANCH_RE.test(r.git_branch) && !r.git_branch.includes('..') ? r.git_branch : '',
     // A7/D2: classification provenance, trust tier, cost, and the versioned
     // region profile. classifier/trust_tier fail closed to the
     // no-independent-evidence defaults ('deterministic'/'self_reported') —
@@ -638,6 +842,15 @@ function enforceRecordDetailed(raw, opts = {}) {
     // goes through oneOf(), and every record — even a perfectly honest one
     // — has this field "overwritten", so it carries no noisy-sender signal.)
     region_taxonomy: REGION_TAXONOMY,
+    // Which CLIENT BUILD produced this record (e.g. '1.5.0'). Carries no
+    // identity — it is the same string for everyone on that release — but it
+    // is load-bearing for cost accuracy: est_cost_usd is computed from a
+    // price table that ships INSIDE the client (lib/pricing.js), so this is
+    // the only way to tell whether a row was priced by a build that knew
+    // about a given model. Also how a fleet upgrade is measured rather than
+    // guessed. Reuses the user_label shape (semver matches it); '' from any
+    // client that predates the field, which reads correctly as "unknown".
+    plugin_version: trackedShape('plugin_version', extractorVersionOrEmpty),
     // Echo the inbound schema_version (capped at 99) rather than overwriting
     // it — the hub needs to know which sender build produced a record.
     // Absent/unparseable/zero all fall back to 3 (the version before
@@ -720,6 +933,12 @@ const SCHEMA_FIELDS = [
     note: 'Tokens served from prompt cache reads this session, clamped to a non-negative integer.' },
   { name: 'cache_creation_tokens', type: 'int',
     note: 'Tokens spent writing to prompt cache this session, clamped to a non-negative integer.' },
+  { name: 'cache_creation_5m_tokens', type: 'int',
+    note: 'Cache-creation tokens written to the 5-minute ephemeral tier, clamped to a non-negative integer. Billed at 1.25x the base input rate; kept separate from the 1-hour tier because that one is billed at 2x. Zero from clients that predate the split.' },
+  { name: 'cache_creation_1h_tokens', type: 'int',
+    note: 'Cache-creation tokens written to the 1-hour ephemeral tier, clamped to a non-negative integer. Billed at 2x the base input rate. This is the overwhelmingly dominant tier for Claude Code, which is why it must not be collapsed into the flat cache_creation_tokens total.' },
+  { name: 'speed', type: 'enum', enumRef: 'SPEEDS',
+    note: 'Whether the session ran in fast mode, which bills the same model at a premium rate; \'unknown\' when the client did not report it or the session mixed fast and standard turns. A pricing input, not a performance metric.' },
   { name: 'cache_hit_ratio', type: 'float01',
     note: 'Fraction of tokens served from cache rather than freshly processed, 0 to 1.' },
   { name: 'est_cost_usd', type: 'usd',
@@ -735,7 +954,7 @@ const SCHEMA_FIELDS = [
   { name: 'user_edit_rate', type: 'float01',
     note: 'Fraction of assistant-authored lines the user subsequently edited by hand, 0 to 1.' },
   { name: 'model', type: 'string', shape: MODEL_RE.source,
-    note: 'Model identifier used for the session\'s primary work, lowercase alphanumeric/dot/hyphen only, capped at 60 chars; empty if absent or non-conforming.' },
+    note: 'Model identifier used for the session\'s primary work, lowercase alphanumeric/dot/hyphen only, capped at 60 chars; empty if absent or non-conforming. Cloud-provider ids (Bedrock, Vertex, ARNs) are reduced to the first-party id before shipping, so an ARN\'s account id never leaves the machine.' },
   { name: 'denials', type: 'int',
     note: 'Number of tool-permission prompts the user denied, clamped to a non-negative integer capped at 1000.' },
   { name: 'denial_rate', type: 'float01',
@@ -748,6 +967,26 @@ const SCHEMA_FIELDS = [
     note: 'Deduplicated list of prompt-quality antipatterns detected in the session\'s user prompts; unrecognized values are dropped.' },
   { name: 'prompt_quality', type: 'float01',
     note: 'Composite quality score for the session\'s user prompts, 0 to 1.' },
+  { name: 'prompt_kinds', type: 'object', enumRef: 'PROMPT_KINDS',
+    note: 'How many of the session\'s typed messages did each thing — start a task, steer, report a bug, ask a question, or give a go-ahead — keyed by exactly those five kinds; missing keys default to 0, unrecognized keys are dropped, and each value is clamped to a non-negative integer capped at 5000. Counts only; message text never ships.' },
+  { name: 'tasks', type: 'object',
+    note: 'The session split into tasks (one per message that started work or reported a bug), each with kind (start|bug), how it ended (path: abandoned|clarified|corrected|handed_off|first_try; ended_with: summary|question_to_user|error|handoff|nothing), whether Claude checked its own work after its last edit (verification: no_edits|agent_checked|handed_to_person|claimed_unchecked|unchecked|unknown), whether a correction pointed at the wrong project or environment (target_hint), a count of messages by kind, and counts of test runs, tool errors and commits inside it. At most 50 entries; enums, booleans and integers only, never text.' },
+  { name: 'git_outcome', type: 'object',
+    note: 'Null until the session\'s commits have been re-checked against the repo, 7 and again 30 days after the session. Then: which checkpoint (d7|d30), how many commits the session made and how many reached the default branch (and how: ancestor, patch_id, squash, lines, none), how many were reverted, how many of their added lines are still there, changed by the same author or by someone else, the type of commit that replaced them (fix, revert, neutral, rework), days to the first fix, and the same counts per task. Integers, enums and booleans only; no paths, commit ids or messages.' },
+  { name: 'task_count', type: 'int',
+    note: 'True number of tasks in the session, which may exceed the 50 shipped in tasks.' },
+  { name: 'skills_used', type: 'object',
+    note: 'Skills the session invoked, with call counts (up to 20). A name is shown as-is (e.g. "superpowers:brainstorming") only when that exact skill exists in a plugin installed from Anthropic\'s official plugin directory, or is one of Claude Code\'s own skills; any other skill ships as "h:" plus a keyed hash of its name, so a private skill is countable across people but never named.' },
+  { name: 'mcp_servers_used', type: 'object',
+    note: 'MCP servers the session called, with call counts (up to 20). A server name is shown as-is only when it is declared by a plugin installed from the official directory, is built into Claude Code, or is a claude.ai directory connector; others (including custom connectors) ship as "h:" plus a keyed hash.' },
+  { name: 'cache_rebuilds', type: 'object',
+    note: 'Prompt-cache rebuilds: calls that re-wrote at least half of a 20k+ token context. Counts and tokens by likely cause (start, idle over 1 hour, idle 5 to 60 minutes, model switch, other), the tokens of the avoidable ones by cache tier, their dollar cost over reading the same tokens from cache (re-derived by the server from those tokens), and the share written to the 5-minute tier. Numbers only.' },
+  { name: 'limit_hits', type: 'object',
+    note: 'How many times Claude Code showed a usage-limit notice in the session, by kind (weekly, session, model, spend, other). Counts only.' },
+  { name: 'branch_key', type: 'string', shape: BRANCH_KEY_RE.source,
+    note: 'A keyed hash of the repository and git branch the session ran on, so sessions on the same branch of the same repo can be grouped without the branch name leaving the machine. Empty when unknown.' },
+  { name: 'git_branch', type: 'string', shape: GIT_BRANCH_RE.source,
+    note: 'The git branch name. Empty unless an org admin turned on sharing git refs for the team (off by default); tasks then also carry their short commit ids.' },
   { name: 'is_continuation', type: 'bool',
     note: 'Whether this session continued an earlier session (e.g. via --continue or --resume).' },
   { name: 'compactions', type: 'int',
@@ -786,6 +1025,8 @@ const SCHEMA_FIELDS = [
     note: 'Per-region tool-call counts keyed by exactly the eight functional regions named in region_taxonomy; missing keys default to 0, unrecognized keys are dropped, and each value is clamped to a non-negative integer capped at 5000.' },
   { name: 'region_taxonomy', type: 'version',
     note: 'Fixed version stamp for the region taxonomy that region_counts\' keys belong to; always the literal \'functional-8.v1\' in schema_version 4 — any other value a sender sends is overwritten, since this is a schema assertion, not a client-chosen setting.' },
+  { name: 'plugin_version', type: 'version', shape: EXTRACTOR_VERSION_RE.source,
+    note: 'Version string of the Tokenomica client build that produced this record (e.g. \'1.5.0\'); identical for every user on a release, so it identifies a build and never a person. Empty when the sending client predates the field. Used to tell which price table a row\'s cost estimate came from and to measure fleet upgrade coverage.' },
   { name: 'schema_version', type: 'int',
     note: 'Schema version the sending client believes it used, echoed back as given (numeric strings are accepted too); values above 99 clamp to 99 rather than falling back. Defaults to 3 (the version before this field was stamped explicitly) only when the value is absent, non-numeric, or 0.' },
 ];
@@ -803,8 +1044,9 @@ module.exports = {
   scrubText, enforceRecord, enforceRecordDetailed,
   ACTIVITY_CATEGORIES, DOMAINS, TECHNIQUES, OUTCOMES,
   SECRET_PATTERNS, PII_PATTERNS, FRICTION_REASONS, SATISFACTIONS, SERVICE_TIERS,
-  PROMPT_ANTIPATTERNS, PERMISSION_MODES, COACH_NUDGES, PROJECT_LABEL_RE,
-  BUILTIN_TOOLS, CLASSIFIERS, TRUST_TIERS, REGION_TAXONOMY, REGION_KEYS,
+  PROMPT_ANTIPATTERNS, PROMPT_KINDS, PERMISSION_MODES, COACH_NUDGES, PROJECT_LABEL_RE,
+  BUILTIN_TOOLS, CLASSIFIERS, TRUST_TIERS, REGION_TAXONOMY, REGION_KEYS, SPEEDS,
   FACT_KEYS, FACT_VALUE_RE,
+  TASK_PATHS, TASK_ENDINGS, TASK_KINDS, TASKS_CAP, VERIFICATIONS, GIT_CHECKPOINTS, GIT_BASES, GIT_LANDED_VIA, GIT_REPLACED,
   assertShapes, ALLOWED_SHAPES, SCHEMA_FIELDS,
 };

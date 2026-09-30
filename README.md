@@ -8,20 +8,34 @@ Claude Code session ends.
 ## Install
 
 ```
-claude plugin marketplace add goverissimo/claudium-plugin
+claude plugin marketplace add https://github.com/goverissimo/claudium-plugin.git
 claude plugin install tokenomica@tokenomica
 ```
 
-## Configure
-
-Sign in to your team’s Tokenomica dashboard, open **/connect**, claim your
-display name, and generate a token. Then write the config exactly as the
-page shows you:
+## Connect
 
 ```
-mkdir -p ~/.tokenomica && cat > ~/.tokenomica/plugin.json <<'EOF'
+/tokenomica:login https://your-dashboard.example.com
+```
+
+That opens a browser tab where you approve this machine, then writes
+`~/.tokenomica/plugin.json` for you. Nothing to copy, no token in your shell
+history. If no browser can open — over SSH, in a container, on a remote dev
+box — it prints a short code you enter at `/activate` on any device instead.
+
+The approval screen names the machine that asked (hostname, OS, plugin
+version). If you didn't start it, deny it: nothing is shared.
+
+Run it again any time to reconnect — after a revoked token, say. Everything
+captured while you were disconnected is queued locally and uploads the moment
+you do, and your existing settings (`tier`, `classify`, `project_labels`) are
+preserved.
+
+The config it writes looks like this, and you can still write it by hand for a
+scripted or CI install (mint a token at **/connect**):
+
+```
 { "url": "https://your-dashboard.example.com", "token": "<your token>" }
-EOF
 ```
 
 - `url` — your team’s dashboard origin.
@@ -60,11 +74,15 @@ resolved tier and its one-line meaning.
 
 ### Naming your projects
 
-By default each project ships under a `p-<12hex>` pseudonym: an HMAC of the
-derived project name (the last path segment), unique per machine. To ship a readable name instead, add a
-`project_labels` map to `~/.tokenomica/plugin.json`, keyed by the project name
-Claude Code derives internally (usually the last path segment of the
-project directory) and valued by the label you want it to ship as:
+By default each project ships under a `p-<12hex>` pseudonym — a one-way hash of
+the repo's git remote (see "Naming your projects across the team" below), or of
+the local directory name when there is no remote. To ship a readable name
+instead, add a `project_labels` map to `~/.tokenomica/plugin.json`, keyed by the
+**repo name** (the last segment of the remote, e.g. `checkout` for
+`git@github.com:acme/checkout.git`) and valued by the label you want it to ship
+as. Because the repo name is identical on every machine, one config line can be
+shared with the whole team. The old key — the local directory name — still
+works as a fallback:
 
 ```
 { "url": "...", "token": "...", "project_labels": { "demo": "backend-team" } }
@@ -94,8 +112,48 @@ notice for good, without uploading anything; you can still run
 ## Check it’s working
 
 Run `/tokenomica:status` inside Claude Code — it shows your config target,
-whether history has imported (pending / done / skipped by you), and whether
-the server accepts your token.
+whether history has imported (pending / done / skipped by you), your plugin
+version, how many sessions are waiting to upload, and whether the server
+accepts your token. If anything is queued and you are online, running it
+delivers the backlog then and there.
+
+## Every session is captured
+
+The plugin does not fire a single upload and hope. When a session ends the
+record is written to a durable queue on your machine **before** any network
+call, and only leaves the queue once the dashboard has confirmed it. If you
+were offline, on a VPN, mid-flight, or the dashboard was being redeployed, the
+session waits and goes out on a later session end — with backoff, so a laptop
+that has been offline for a fortnight doesn't hammer a dead endpoint.
+
+It also **reconciles**. Some sessions never get a SessionEnd hook at all — a
+force-quit, a dead battery, a closed lid, a CLI self-update. Each run compares
+the transcripts on disk against the ones this machine has already queued and
+picks up the difference, so a session is captured because its transcript
+exists, not because a hook happened to survive.
+
+Reconciliation never reaches back past the moment you connected: your existing
+history still only moves when you run `/tokenomica:backfill`.
+
+`/tokenomica:status` shows the queue (`upload queue: 0 pending` is the healthy
+state) and will drain it on the spot if anything is waiting.
+
+## Naming your projects across the team
+
+Projects are identified by their **git remote**, not by the folder they happen
+to live in on your machine. That means `~/src/checkout`, `~/work/checkout-svc`
+and a `checkout-hotfix` worktree are all one project, and — more importantly —
+so is your teammate's clone. Without this, the same repo showed up as a
+different project for every person on the team and "what does this repo cost
+us?" could not be answered at all.
+
+What ships is still only a one-way hash: your remote URL, and any credentials
+embedded in it, never leave your machine. The hash is keyed with a salt shared
+by your team, which the plugin fetches once from your dashboard — nothing for
+you to configure, and existing installs pick it up automatically.
+
+A session outside a git repo, or one whose only remote is a local path, falls
+back to the per-machine pseudonym as before.
 
 ## What gets uploaded
 
@@ -107,7 +165,24 @@ the server accepts your token.
   and tools observed) rides along with the usage record; free text is
   redacted before it ever leaves.
 - The SessionEnd hook always exits 0 — an unreachable dashboard or bad config
-  never breaks your Claude Code session.
+  never breaks your Claude Code session, and never costs you the session's
+  record either (see "Every session is captured" above).
+- Which skills and MCP servers a session used, with call counts. Names from
+  Anthropic's official plugin directory and Claude Code's own skills are sent
+  as-is (e.g. `superpowers:brainstorming`, `figma`); any other name is sent
+  only as a keyed hash, so a private skill can be counted but never named.
+- Cache rebuilds (counts and tokens by likely cause) and how many times Claude
+  Code showed a usage-limit notice. Numbers only.
+- A keyed hash of your git branch, so sessions on the same branch can be
+  grouped without the branch name leaving your machine.
+- Only if an admin of your organization turns on **sharing git refs** (off by
+  default; Team page on the dashboard): the branch name and each task's short
+  commit ids, so a session links to the commits it produced. Commit messages,
+  diffs and file contents never leave your machine either way.
+- Cost estimates are recomputed by the dashboard from the token counts you
+  send, using a price table it owns. That means a new model is never silently
+  mispriced by an out-of-date plugin, and a pricing correction fixes your whole
+  history rather than only what you send from then on.
 
 ## Classification
 

@@ -92,4 +92,63 @@ function sanitizeLabel(v) {
   return LABEL_SHAPE_RE.test(s) ? s : '';
 }
 
-module.exports = { hmac12, loadSalt, sanitizeLabel };
+// ORG SALT — the cross-machine half of stable project identity.
+//
+// loadSalt above is deliberately per-machine, which is right for anything
+// whose identity is local (MCP tool names, subagent types). It is exactly
+// WRONG for project_label: five engineers on one repo hashed it five
+// different ways, so team-level cost-per-project could not be computed (see
+// lib/project-key.js's header).
+//
+// The org salt fixes that. Unlike the machine salt it is NEVER generated
+// here: it is minted once per org by the dashboard and handed to each
+// authorized sender over the same authenticated channel it already uploads
+// records on (GET /api/connect/salt). This file only caches it. Consequences
+// that are deliberate:
+//   - No dashboard reachable => no org salt => callers fall back to the
+//     machine salt. Labels are useless for team aggregation but the RECORD
+//     still ships. Never lose a session over a cosmetic field.
+//   - The salt is a shared secret across the org's machines, so it is stored
+//     0600 like the machine salt, and a rotation simply changes which bucket
+//     future records land in (history is not rewritten).
+const ORG_SALT_FILE = 'org-salt';
+
+function loadOrgSalt(dir = configDir()) {
+  try {
+    const existing = fs.readFileSync(path.join(dir, ORG_SALT_FILE), 'utf8').trim();
+    if (existing) return existing;
+  } catch { /* not fetched yet, or unreadable — caller falls back */ }
+  return '';
+}
+
+// saveOrgSalt(salt, dir) -> the stored value ('' when the input is unusable,
+// so a caller can distinguish "cached" from "server sent nothing"). Writes
+// are best-effort: a read-only HOME must degrade to re-fetching next run,
+// never to throwing inside the SessionEnd finisher.
+function saveOrgSalt(salt, dir = configDir()) {
+  const s = String(salt == null ? '' : salt).trim();
+  if (!s) return '';
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, ORG_SALT_FILE), s, { mode: 0o600 });
+  } catch { /* best-effort cache; the next run just fetches again */ }
+  return s;
+}
+
+// The org's sharing policy, cached beside the org salt and refreshed on the
+// same fetch. Missing or unreadable means the default: share nothing extra.
+const ORG_POLICY_FILE = 'org-policy.json';
+function loadOrgPolicy(dir = configDir()) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(dir, ORG_POLICY_FILE), 'utf8'));
+    return { shareGitRefs: j && j.share_git_refs === true, fetchedAt: j && j.fetched_at || null };
+  } catch { return { shareGitRefs: false, fetchedAt: null }; }
+}
+function saveOrgPolicy(policy, dir = configDir(), now = Date.now()) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, ORG_POLICY_FILE), JSON.stringify({ share_git_refs: !!(policy && policy.share_git_refs), fetched_at: new Date(now).toISOString() }), { mode: 0o600 });
+  } catch { /* best-effort; the default is the safe side */ }
+}
+
+module.exports = { hmac12, loadSalt, sanitizeLabel, loadOrgSalt, saveOrgSalt, loadOrgPolicy, saveOrgPolicy, ORG_SALT_FILE, ORG_POLICY_FILE };

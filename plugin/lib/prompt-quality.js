@@ -28,6 +28,7 @@ const CORRECTIVE = /^(no\b|not\b|nope\b|wrong\b|that'?s (?:not|wrong)|i meant\b|
 const CONCRETE = /[\\/]|`|\.(js|ts|tsx|jsx|py|rb|go|rs|java|css|html|md|json|sql|sh|yml|yaml)\b|error|exception|line \d|https?:/i;
 
 const words = t => String(t).trim().split(/\s+/).filter(Boolean);
+const { classifyPromptKind, PROMPT_KINDS } = require('./prompt-kind');
 
 function wordSet(text) {
   return new Set(String(text).toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 2));
@@ -56,15 +57,25 @@ function detectPromptAntipatterns(session) {
   const antipatterns = [];
 
   if (!first.trim()) {
-    return { antipatterns: [], promptQualityScore: 0.5, signals: { prompts: 0 } };
+    return { antipatterns: [], promptQualityScore: 0.5, kinds: Object.fromEntries(PROMPT_KINDS.map(k => [k, 0])), signals: { prompts: 0 } };
   }
 
   const firstWords = words(first);
-  const taskLike = IMPERATIVE.test(first);
   const isContinuation = !!(session && session.isContinuation);
 
-  // vague_goal — short AND nothing concrete to anchor on.
-  if (firstWords.length < 8 && !CONCRETE.test(first) && !isContinuation) {
+  // What each message DOES decides which practices it is judged on: a
+  // question or a go-ahead has no goal to state and nothing to make
+  // checkable, so it is never "vague" or "missing criteria". Hand-labelling
+  // 60 messages showed only a third of them start a task.
+  const kindOf = prompts.map((p, i) => classifyPromptKind(p, { first: i === 0 }));
+  const kinds = Object.fromEntries(PROMPT_KINDS.map(k => [k, 0]));
+  for (const k of kindOf) kinds[k]++;
+  const firstKind = kindOf[0];
+  const firstIsTask = firstKind === 'start' || firstKind === 'steer';
+  const taskLike = firstIsTask && IMPERATIVE.test(first);
+
+  // vague_goal — a task handed over short AND with nothing concrete to anchor on.
+  if (firstIsTask && firstWords.length < 8 && !CONCRETE.test(first) && !isContinuation) {
     antipatterns.push('vague_goal');
   }
 
@@ -89,8 +100,11 @@ function detectPromptAntipatterns(session) {
   if (corrections >= 2) antipatterns.push('correction_loop');
 
   // scope_creep — later prompts that are NEW asks unrelated to the first one.
+  // Only messages that hand over or steer work can be a new ask.
   const firstSet = wordSet(first);
-  const newAsks = prompts.slice(1).filter(p => {
+  const newAsks = prompts.slice(1).filter((p, j) => {
+    const k = kindOf[j + 1];
+    if (k !== 'start' && k !== 'steer') return false;
     if (CORRECTIVE.test(p.trim())) return false;
     if (words(p).length < 5) return false;
     return IMPERATIVE.test(p) && jaccard(firstSet, wordSet(p)) < 0.15;
@@ -111,6 +125,7 @@ function detectPromptAntipatterns(session) {
   return {
     antipatterns,
     promptQualityScore: score,
+    kinds,
     signals: { prompts: prompts.length, corrections, newAsks, preEditSearches, firstAsks: askCount(first) },
   };
 }

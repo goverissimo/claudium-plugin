@@ -8,7 +8,7 @@
 //
 // The formulas are heuristic v1 — tune the weights against real sessions.
 
-const { estimateCost } = require('./pricing');
+const { sessionCost, priceAt } = require('./pricing');
 
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
 
@@ -95,11 +95,16 @@ function reworkScore(session) {
 
 // The LAST test/build signal wins: failing early then passing at the end is
 // the normal shape of a healthy session, not a failure.
+//
+// Only test/build OUTPUT counts. A plain tool error (ls on a missing path, a
+// rejected MCP call, a denied command) is not a failing test — it already
+// counts through errorRate/errFactor, and treating it as one flipped 27 of 29
+// "tests failed" sessions on one machine while their real test runs passed.
 function scanOutcomeText(session) {
   let state = null;            // 'pass' | 'fail' | null
   let everFailed = false;
   for (const r of session.toolResults || []) {
-    const fail = r.isError || TEST_FAIL.test(r.text);
+    const fail = TEST_FAIL.test(r.text);
     const pass = TEST_PASS.test(r.text);
     if (fail) { state = 'fail'; everFailed = true; }
     if (pass && !fail) state = 'pass';
@@ -216,13 +221,23 @@ function computeMetrics(session) {
   // Token economics (cost is an estimate — see lib/pricing.js).
   const cacheDenom = (session.cacheReadTokens || 0) + (session.cacheCreationTokens || 0);
   const cacheHitRatio = cacheDenom > 0 ? (session.cacheReadTokens || 0) / cacheDenom : 0;
-  const estCostUsd = estimateCost({
+  // Same table, split and date as the server's price book, so the local figure
+  // and the dashboard's agree for a session priced by a current plugin. Fast
+  // turns are priced at the fast rate and the rest at the standard rate.
+  const estCostUsd = sessionCost({
     model: session.model,
+    at: session.startedAt,
+    fast: session.fastTokens,
     inputTokens: session.inputTokens || 0,
     outputTokens: session.outputTokens != null ? session.outputTokens : (session.tokenTotal || 0),
     cacheReadTokens: session.cacheReadTokens || 0,
     cacheCreationTokens: session.cacheCreationTokens || 0,
+    cacheCreation5mTokens: session.cacheCreation5mTokens || 0,
+    cacheCreation1hTokens: session.cacheCreation1hTokens || 0,
   });
+  // False when the model is not in the price table (a model newer than this
+  // plugin): the report and the coach say "unpriced" instead of showing $0.
+  const costKnown = !session.model || priceAt(session.model, session.startedAt).known;
 
   return {
     errorRate: round3(errorRate),
@@ -242,6 +257,7 @@ function computeMetrics(session) {
     frustrationScore: frustration.score,
     cacheHitRatio: round3(cacheHitRatio),
     estCostUsd,
+    costKnown,
     linesAdded: session.linesAdded || 0,
     linesRemoved: session.linesRemoved || 0,
     commits,

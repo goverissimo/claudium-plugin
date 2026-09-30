@@ -17,26 +17,107 @@
 // lib/extract.js) stays local and never reaches the shipped record.
 
 const { computeMetrics } = require('./metrics');
-const { enforceRecord, enforceRecordDetailed, REGION_TAXONOMY } = require('./scrub');
+const { enforceRecord, enforceRecordDetailed, REGION_TAXONOMY, TASKS_CAP } = require('./scrub');
 const { detectPromptAntipatterns } = require('./prompt-quality');
 const { hmac12, sanitizeLabel } = require('./anonymize');
+const { repoName } = require('./project-key');
 const { toolToRegion } = require('./regions');
+const { segmentTasks } = require('./task-path');
+const { canonicalModel, rebuildAvoidableUsd } = require('./pricing');
+const { shipExtensionCalls } = require('./extensions');
+
+// Cache rebuilds grouped by their likely cause. `start` is the first call of a
+// session (a cold cache is unavoidable there); the rest are what a habit or a
+// setting could have prevented. Tokens, not dollars, ship; dollars are derived
+// from the session's model like est_cost_usd (lib/price-book.js).
+const REBUILD_CAUSES = ['start', 'idle_over_1h', 'idle_5_to_60m', 'model_switch', 'other'];
+function rebuildCause(r) {
+  if (r.gapS == null) return 'start';
+  if (r.modelChanged) return 'model_switch';
+  if (r.gapS > 3600) return 'idle_over_1h';
+  if (r.gapS > 300) return 'idle_5_to_60m';
+  return 'other';
+}
+function summarizeRebuilds(list, { model, at, speed } = {}) {
+  const by = Object.fromEntries(REBUILD_CAUSES.map(k => [k, { count: 0, tokens: 0 }]));
+  let tokens5m = 0;
+  // The avoidable ones (everything but the cold start), split by cache tier
+  // because the two tiers are billed at different write rates.
+  const avoidable = { '5m': 0, '1h': 0 };
+  for (const r of Array.isArray(list) ? list : []) {
+    const cause = rebuildCause(r);
+    const t = Number(r.tokens) || 0;
+    const c = by[cause];
+    c.count++; c.tokens += t;
+    if (r.tier === '5m') tokens5m += t;
+    if (cause !== 'start') avoidable[r.tier === '5m' ? '5m' : '1h'] += t;
+  }
+  const total = REBUILD_CAUSES.reduce((a, k) => a + by[k].tokens, 0);
+  return {
+    by_cause: by,
+    avoidable_tokens: avoidable,
+    avoidable_usd: rebuildAvoidableUsd({ model, at, speed, tokens5m: avoidable['5m'], tokens1h: avoidable['1h'] }),
+    share_5m: total ? Math.round((tokens5m / total) * 1000) / 1000 : 0,
+  };
+}
+// One 12-char id per commit. Claude Code records short shas (7 chars) and the
+// manifest full ones, so the same commit can arrive twice; the longer one
+// wins and anything that is a prefix of a kept id is dropped.
+function commitIds(shas) {
+  const kept = [];
+  const all = shas.map(x => String(x || '').toLowerCase()).filter(x => /^[0-9a-f]{7,40}$/.test(x))
+    .sort((a, b) => b.length - a.length);
+  for (const sha of all) {
+    const id = sha.slice(0, 12);
+    if (!kept.some(k => k.startsWith(id) || id.startsWith(k))) kept.push(id);
+  }
+  return kept.slice(0, 20);
+}
+function summarizeLimitHits(list) {
+  const out = { weekly: 0, session: 0, model: 0, spend: 0, other: 0 };
+  for (const h of Array.isArray(list) ? list : []) if (h && out[h.kind] != null) out[h.kind]++;
+  return out;
+}
 
 // Turns the raw, filesystem-derived project label into the value that's safe
-// to SHIP: a sanitized user-assigned override if one is configured for this
-// derived name, else a stable per-machine HMAC pseudonym 'p-<12hex>'. Raw
-// path-derived text never ships once a salt is present.
+// to SHIP: a sanitized user-assigned override if one is configured, else a
+// stable HMAC pseudonym 'p-<12hex>'. Raw path-derived text never ships once a
+// salt is present.
 //
-// With NO salt (the default — pure/test contexts and the LOCAL-only tools
-// scripts/usage-report.js, scripts/usage-tui.js, scripts/demo-insights.js,
-// which never pass one), the derived name is SANITIZED, not hashed:
-// 'MyClient Corp' -> 'myclient-corp' — still human-readable for local
-// display, but also conformant to enforceRecord's shape gate, so
-// non-canonical derived names don't blank out locally.
-function shipProjectLabel(rawLabel, salt, projectLabels) {
+// PRECEDENCE, and why:
+//   1. An explicit projectLabels override. Matched against the REPO NAME
+//      (lib/project-key.js's repoName) before the machine-local derived name,
+//      because the repo name is the same string on every machine — so ONE
+//      config line ({"checkout": "payments"}) can be shared with the whole
+//      team, where the old dir-name key could not.
+//   2. hmac12(ORG salt, projectKey) — the cross-machine pseudonym. This is
+//      the case that makes team cost-per-project computable at all: same repo
+//      + same org salt => same label on every teammate's machine.
+//   3. hmac12(MACHINE salt, rawLabel) — the legacy per-machine pseudonym.
+//      Still correct for one person's own view, and the honest fallback when
+//      there's no org salt yet or the session isn't in a repo with a remote.
+//      Records NEVER block on the org salt being available (see
+//      lib/anonymize.js loadOrgSalt) — a cosmetic grouping field is not worth
+//      dropping a session over.
+//
+// With NO salt of either kind (the default — pure/test contexts and the
+// LOCAL-only tools scripts/usage-report.js, scripts/usage-tui.js,
+// scripts/demo-insights.js, which never pass one), the derived name is
+// SANITIZED, not hashed: 'MyClient Corp' -> 'myclient-corp' — still
+// human-readable for local display, but also conformant to enforceRecord's
+// shape gate, so non-canonical derived names don't blank out locally.
+function shipProjectLabel(rawLabel, salt, projectLabels, { orgSalt = null, projectKey = '' } = {}) {
+  if (!salt && !orgSalt) return sanitizeLabel(rawLabel);
+  const labels = projectLabels && typeof projectLabels === 'object' ? projectLabels : null;
+  if (labels) {
+    const byRepo = projectKey ? sanitizeLabel(labels[repoName(projectKey)]) : '';
+    if (byRepo) return byRepo;
+    const byDir = sanitizeLabel(labels[rawLabel]);
+    if (byDir) return byDir;
+  }
+  if (orgSalt && projectKey) return 'p-' + hmac12(orgSalt, projectKey);
   if (!salt) return sanitizeLabel(rawLabel);
-  const assigned = projectLabels && typeof projectLabels === 'object' ? projectLabels[rawLabel] : null;
-  return sanitizeLabel(assigned) || ('p-' + hmac12(salt, rawLabel));
+  return 'p-' + hmac12(salt, rawLabel);
 }
 
 // A2/A5: MCP tool names (session.toolsUsed entries starting 'mcp__') and
@@ -115,13 +196,17 @@ function regionCounts(session) {
 // flag ONLY decides whether session_facts itself is forced to [] before the
 // record leaves the machine. Default true preserves every existing caller's
 // behavior (today's default tier is 'full', which ships facts).
-function buildRecord({ session, metrics, abstraction = {}, gitTruth = null, coachNudges = [], salt = null, projectLabels = null, shipFacts = true }) {
+// orgPolicy.shareGitRefs (an org admin setting, off by default): when on,
+// each task ships its short commit ids and the session its branch name, so the
+// dashboard can answer "who made this commit". When off, only a keyed hash of
+// the branch ships, which groups sessions on the same branch without naming it.
+function buildRecord({ session, metrics, abstraction = {}, gitTruth = null, coachNudges = [], salt = null, projectLabels = null, shipFacts = true, orgSalt = null, projectKey = '', pluginVersion = '', orgPolicy = {} }) {
   const m = metrics || computeMetrics(session);
   const pq = detectPromptAntipatterns(session);
   const { toolsUsed, mcpToolCount, mcpToolHashes } = splitMcpTools(session.toolsUsed, salt);
   return enforceRecord({
     claude_session_id: session.claudeSessionId,
-    project_label: shipProjectLabel(session.projectLabel, salt, projectLabels),
+    project_label: shipProjectLabel(session.projectLabel, salt, projectLabels, { orgSalt, projectKey }),
     started_at: session.startedAt,
     ended_at: session.endedAt,
     duration_s: session.durationS,
@@ -146,6 +231,14 @@ function buildRecord({ session, metrics, abstraction = {}, gitTruth = null, coac
     input_tokens: session.inputTokens,
     cache_read_tokens: session.cacheReadTokens,
     cache_creation_tokens: session.cacheCreationTokens,
+    // The 5m/1h split and the speed are pricing inputs: without them the
+    // server's book prices every write at the 1h rate and never applies fast
+    // rates, and disagrees with est_cost_usd. A session that mixed fast and
+    // standard turns ships 'unknown' (priced standard on the server); its
+    // est_cost_usd still prices each turn at its own rate.
+    cache_creation_5m_tokens: session.cacheCreation5mTokens,
+    cache_creation_1h_tokens: session.cacheCreation1hTokens,
+    speed: session.speed === 'fast' || session.speed === 'standard' ? session.speed : 'unknown',
     cache_hit_ratio: m.cacheHitRatio,
     est_cost_usd: m.estCostUsd,
     service_tier: session.serviceTier,
@@ -153,7 +246,7 @@ function buildRecord({ session, metrics, abstraction = {}, gitTruth = null, coac
     lines_removed: m.linesRemoved,
     commits: m.commits,
     user_edit_rate: m.userEditRate,
-    model: session.model || abstraction.model,
+    model: canonicalModel(session.model || abstraction.model),
     // human-disagreement + frustration
     denials: m.denials,
     denial_rate: m.denialRate,
@@ -162,10 +255,41 @@ function buildRecord({ session, metrics, abstraction = {}, gitTruth = null, coac
     // prompt quality (enums + score only)
     prompt_antipatterns: pq.antipatterns,
     prompt_quality: pq.promptQualityScore,
+    prompt_kinds: pq.kinds,
+    // how each task ended (lib/task-path.js) — enums + counts; prompt_index
+    // and commit_shas are local-only and dropped here, before scrub ever
+    // sees them
+    ...(() => {
+      const all = segmentTasks(session);
+      return {
+        tasks: all.slice(0, TASKS_CAP).map(({ prompt_index, commit_shas, ...t }) => {
+          if (!orgPolicy.shareGitRefs) return t;
+          // Commits Claude Code recorded for this task, plus the ones the
+          // day-0 manifest found in git for it (session.taskCommits, set by
+          // the plugin after it reads the repo; most commits made with
+          // `git commit` in Bash are only found that way).
+          const fromGit = (session.taskCommits && session.taskCommits[t.index]) || [];
+          return { ...t, commit_ids: commitIds([...fromGit, ...(commit_shas || [])]) };
+        }),
+        task_count: all.length,
+      };
+    })(),
     // threading + orchestration
     is_continuation: session.isContinuation,
     compactions: session.compactions,
     subagent_types: shipSubagentTypes(session.subagentTypes, salt),
+    // Which skills and MCP servers the session used, with call counts. Names
+    // from the official plugin directory and Claude Code's own skills ship
+    // readable; anything else is a keyed hash (lib/extensions.js).
+    skills_used: shipExtensionCalls(session.skillCalls, { salt: orgSalt || salt, kind: 'skill' }),
+    mcp_servers_used: shipExtensionCalls(session.mcpServerCalls, { salt: orgSalt || salt, kind: 'mcp' }),
+    cache_rebuilds: summarizeRebuilds(session.cacheRebuilds, { model: session.model, at: session.startedAt, speed: session.speed }),
+    limit_hits: summarizeLimitHits(session.limitHits),
+    // Scoped to the repo: every repo has a "main", and "other sessions on
+    // this branch" must not pull in the rest of the org's repos.
+    branch_key: session.gitBranch && (orgSalt || salt)
+      ? 'b-' + hmac12(orgSalt || salt, `${projectKey || session.cwd || ''}\0${session.gitBranch}`) : '',
+    git_branch: orgPolicy.shareGitRefs ? String(session.gitBranch || '').slice(0, 80) : '',
     max_parallel_tools: session.maxParallelTools,
     permission_mode: session.permissionMode,
     // coach feedback loop
@@ -180,6 +304,8 @@ function buildRecord({ session, metrics, abstraction = {}, gitTruth = null, coac
     lines_superseded: gitTruth ? (gitTruth.linesSuperseded || 0) : 0,
     reverts: gitTruth ? gitTruth.reverts : 0,
     git_analyzed_at: gitTruth && gitTruth.analyzed ? gitTruth.analyzedAt : null,
+    // Per-checkpoint git outcome (lib/git-manifest.js): null until surveyed.
+    git_outcome: gitTruth && gitTruth.outcome ? gitTruth.outcome : null,
     // A7/D2: classification provenance + versioned region profile.
     // classifier/extractor_version come from the abstraction (lib/extract.js
     // stamps both on every path — API success and deterministic fallback
@@ -207,6 +333,13 @@ function buildRecord({ session, metrics, abstraction = {}, gitTruth = null, coac
     session_facts: shipFacts ? (abstraction.facts || []) : [],
     region_counts: regionCounts(session),
     region_taxonomy: REGION_TAXONOMY,
+    // Which build of the client produced this record. NOT cosmetic: cost is
+    // priced from a table that ships inside the client (lib/pricing.js), so
+    // "which plugin version sent this?" is the only way to tell whether a
+    // row was priced with a table that knew about a given model. It is also
+    // how a fleet-wide upgrade is measured instead of guessed. Empty from
+    // callers that predate it, which reads correctly as "unknown build".
+    plugin_version: pluginVersion,
     // This build of the sender always emits schema v4.
     schema_version: 4,
   });
@@ -230,4 +363,19 @@ function validateRecordDetailed(raw) {
   return { record, coerced };
 }
 
-module.exports = { buildRecord, validateRecord, validateRecordDetailed };
+// The branch name and per-task commit ids are shared only while the org has
+// sharing git refs turned on. The plugin applies its cached copy of that
+// setting, and the server applies the live one on the way in and on the way
+// out, so turning it off takes effect at once: a laptop with a stale cache,
+// a record queued while it was on, or a modified client cannot bring refs
+// back. Returns a copy; tasks may be a JSON string (from the database).
+function withoutGitRefs(rec) {
+  if (!rec || typeof rec !== 'object') return rec;
+  let tasks = rec.tasks;
+  if (typeof tasks === 'string') { try { tasks = JSON.parse(tasks); } catch { tasks = null; } }
+  const out = { ...rec, git_branch: '' };
+  if (Array.isArray(tasks)) out.tasks = tasks.map(t => { if (!t || typeof t !== 'object') return t; const { commit_ids, ...rest } = t; return rest; });
+  return out;
+}
+
+module.exports = { buildRecord, validateRecord, validateRecordDetailed, withoutGitRefs };

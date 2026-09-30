@@ -44,7 +44,20 @@ const { computeMetrics } = require('./lib/metrics');
 const { buildRecord } = require('./lib/record');
 const { classify } = require('./lib/classify-headless');
 const { getProjectName } = require('./lib/parse');
-const { loadSalt } = require('./lib/anonymize');
+const { loadSalt, loadOrgSalt, loadOrgPolicy } = require('./lib/anonymize');
+const gitManifest = require('./lib/git-manifest');
+const { deriveProjectKey } = require('./lib/project-key');
+const outbox = require('./lib/outbox');
+
+// Stamped onto the enriched record exactly as the day-0 build stamps it
+// (plugin/upload-session.js PLUGIN_VERSION) — the two must agree, since the
+// enriched record overwrites the other under the same key.
+const pluginVersion = (() => {
+  try {
+    const m = JSON.parse(fs.readFileSync(path.join(__dirname, '.claude-plugin', 'plugin.json'), 'utf8'));
+    return typeof m.version === 'string' ? m.version : '';
+  } catch { return ''; }
+})();
 
 const isSubagentPath = p => /[/\\]subagents[/\\]/.test(String(p || ''));
 
@@ -135,11 +148,44 @@ async function enrich({ filepath, claudeDir, url, token, tokenomicaDir, projectL
   let coachNudges = [];
   try { coachNudges = require('./lib/coach-ledger').nudgesFor(session.claudeSessionId, { dir: tokenomicaDir }); } catch {}
   const salt = loadSalt(tokenomicaDir);
-  const record = buildRecord({ session, metrics, abstraction, coachNudges, salt, projectLabels, shipFacts });
+  // Same project-identity inputs the day-0 build uses (see
+  // plugin/upload-session.js buildFor): the enriched record REPLACES that one
+  // under the same key, so if it labelled the project differently the two
+  // would disagree about which bucket the session belongs to.
+  const orgSalt = loadOrgSalt(tokenomicaDir);
+  const wantsKey = !!orgSalt || !!(projectLabels && Object.keys(projectLabels).length);
+  let projectKey = '';
+  if (wantsKey && session.cwd) {
+    try { projectKey = deriveProjectKey({ cwd: session.cwd }).key || ''; } catch { projectKey = ''; }
+  }
+  // Same git-ref inputs too: this record REPLACES the day-0 one, so without
+  // them an org that shares git refs would lose each task's commit ids and
+  // the branch name the moment the enriched copy lands. The day-0 build
+  // already wrote the manifest; this only reads it (no git runs here).
+  const orgPolicy = loadOrgPolicy(tokenomicaDir);
+  if (orgPolicy.shareGitRefs) {
+    try {
+      const m = gitManifest.loadManifest(tokenomicaDir, session.claudeSessionId);
+      if (m) session.taskCommits = gitManifest.taskCommitsOf(m);
+    } catch { /* refs are optional */ }
+  }
+  const record = buildRecord({ session, metrics, abstraction, coachNudges, salt, projectLabels, shipFacts,
+    orgSalt, projectKey, pluginVersion, orgPolicy });
 
+  // Enqueue, then try to deliver. This child is fully detached and can be
+  // killed at any moment (a reboot, a logout), so persisting first is what
+  // keeps the enriched record from evaporating along with it. The queue is
+  // keyed by session id, so this simply replaces the day-0 copy if that one
+  // hasn't gone out yet.
   const base = String(url).replace(/\/+$/, '');
+  outbox.enqueue(record, { dir: tokenomicaDir });
   const r = await post(base, '/api/records', token, record, fetchImpl);
-  return !!(r && r.ok);
+  const ok = !!(r && r.ok);
+  // Delivered directly — retire THIS entry (by id, never "whatever drain
+  // picks next"). If it fails, the copy stays queued and costs one idempotent
+  // re-upsert later; that is the right way round.
+  if (ok) outbox.remove(tokenomicaDir, record.claude_session_id);
+  return ok;
 }
 
 // optsFromEnv(env) -> enrich() opts. The read side of spawnEnrich's
