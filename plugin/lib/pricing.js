@@ -189,7 +189,27 @@ function costWithoutCache({ model, at, speed, inputTokens, outputTokens, cacheRe
   return Math.max(0, Math.round(usd * 1e6) / 1e6);
 }
 
+// What a stored record would have cost with no caching, for the "caching
+// saved you" figures. A plugin-1.8 record carries its tokens per phase and per
+// model (subagents included, often on a cheaper model), so each model's
+// tokens are priced at that model; pricing them all at the session's model
+// overstated the saving by hundreds of dollars on a real session. Older
+// records use their flat counters, as before.
+function recordWithoutCacheUsd(rec) {
+  const pc = rec && rec.phase_costs && typeof rec.phase_costs === 'object' ? rec.phase_costs : null;
+  const rows = pc ? Object.values(pc).flatMap(p => (p && Array.isArray(p.by_model) ? p.by_model : [])) : [];
+  if (!rows.length) {
+    return costWithoutCache({ model: rec && rec.model, at: rec && rec.started_at, speed: rec && rec.speed,
+      inputTokens: rec && rec.input_tokens, outputTokens: rec && rec.token_total,
+      cacheReadTokens: rec && rec.cache_read_tokens, cacheCreationTokens: rec && rec.cache_creation_tokens });
+  }
+  const usd = rows.reduce((a, m) => a + costWithoutCache({ model: m.model, at: rec.started_at, speed: rec.speed,
+    inputTokens: m.input, outputTokens: m.output, cacheReadTokens: m.cache_read,
+    cacheCreationTokens: (Number(m.cache_write_5m) || 0) + (Number(m.cache_write_1h) || 0) }), 0);
+  return Math.round(usd * 1e6) / 1e6;
+}
+
 module.exports = {
-  RULES, FAST_RULES, priceAt, estimateCost, sessionCost, costWithoutCache, canonicalModel, rebuildAvoidableUsd,
+  RULES, FAST_RULES, priceAt, estimateCost, sessionCost, costWithoutCache, recordWithoutCacheUsd, canonicalModel, rebuildAvoidableUsd,
   CACHE_WRITE_5M_MULT, CACHE_WRITE_1H_MULT, CACHE_WRITE_LEGACY_MULT, CACHE_READ_MULT,
 };

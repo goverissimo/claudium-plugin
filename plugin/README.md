@@ -180,6 +180,14 @@ back to the per-machine pseudonym as before.
   only as a keyed hash, so a private skill can be counted but never named.
 - Cache rebuilds (counts and tokens by likely cause) and how many times Claude
   Code showed a usage-limit notice. Numbers only.
+- Where each session's tokens went, by development phase (explore, plan,
+  build, verify, ship, plus operate, think and unclear), with token counts per
+  model. The phase of each call is worked out on your machine from which tools
+  it used; only the totals are sent, never the commands or files.
+- Your subagents' tokens (work handed to the Task or Agent tool), counted in
+  the session's total and sent per model so each is priced at its own rate.
+  Since 1.8.0 a session that delegates costs more than before: it now includes
+  what the subagents spent.
 - A keyed hash of your git branch, so sessions on the same branch can be
   grouped without the branch name leaving your machine.
 - Only if an admin of your organization turns on **sharing git refs** (off by

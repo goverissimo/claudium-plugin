@@ -8,7 +8,8 @@
 //
 // The formulas are heuristic v1 — tune the weights against real sessions.
 
-const { sessionCost, priceAt } = require('./pricing');
+const { sessionCost, priceAt, estimateCost } = require('./pricing');
+const { phaseCosts } = require('./phase');
 
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
 
@@ -224,7 +225,18 @@ function computeMetrics(session) {
   // Same table, split and date as the server's price book, so the local figure
   // and the dashboard's agree for a session priced by a current plugin. Fast
   // turns are priced at the fast rate and the rest at the standard rate.
-  const estCostUsd = sessionCost({
+  // Plugin 1.8+: price per phase and per model, like the server
+  // (lib/price-book.js), so a Sonnet subagent under an Opus session costs
+  // Sonnet money on both sides. A session with fast turns keeps the
+  // fast/standard split below, which phases don't track.
+  const anyFast = session.fastTokens && Object.values(session.fastTokens).some(v => v > 0);
+  const phased = Array.isArray(session.calls) && session.calls.length && !anyFast
+    ? Object.values(phaseCosts(session.calls)).reduce((sum, p) => sum + p.by_model.reduce((s, m) => s + estimateCost({
+        model: m.model, at: session.startedAt,
+        inputTokens: m.input, outputTokens: m.output, cacheReadTokens: m.cache_read,
+        cacheCreation5mTokens: m.cache_write_5m, cacheCreation1hTokens: m.cache_write_1h }), 0), 0)
+    : null;
+  const estCostUsd = phased != null ? Math.round(phased * 1e6) / 1e6 : sessionCost({
     model: session.model,
     at: session.startedAt,
     fast: session.fastTokens,

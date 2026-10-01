@@ -382,6 +382,34 @@ const cacheRebuildsOrNull = (v) => {
 };
 const LIMIT_KINDS = ['weekly', 'session', 'model', 'spend', 'other'];
 const limitHitsOrZeros = (v) => countMap(v && typeof v === 'object' ? v : {}, LIMIT_KINDS);
+// phase_costs / subagent_tokens (lib/phase.js): integer token counts per
+// fixed phase key and per canonical model id. Nothing else survives: unknown
+// phases and fields drop, counts clamp. A model id that fails MODEL_RE (a
+// proxy's 'vendor/model', a local 'name:tag', an account-bearing ARN) is
+// blanked, not dropped: the tokens were spent, and a blank model prices as
+// unknown, so the record is flagged unpriced instead of costing $0.
+const { PHASES, TOKEN_KEYS } = require('./phase');
+const PHASE_MODELS_MAX = 4;
+const tokenRowOrNull = (x) => {
+  if (!x || typeof x !== 'object') return null;
+  const model = typeof x.model === 'string' && MODEL_RE.test(x.model) ? x.model : '';
+  return { model, ...Object.fromEntries(TOKEN_KEYS.map(k => [k, clampInt(x[k])])) };
+};
+const phaseCostsOrNull = (v) => {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  const out = {};
+  for (const p of PHASES) {
+    const src = v[p] && typeof v[p] === 'object' && !Array.isArray(v[p]) ? v[p] : {};
+    const rows = (Array.isArray(src.by_model) ? src.by_model : []).map(tokenRowOrNull).filter(Boolean).slice(0, PHASE_MODELS_MAX);
+    out[p] = { calls: clampInt(src.calls, GIT_INT_MAX), ctx_avg: clampInt(src.ctx_avg, 10000000), by_model: rows };
+  }
+  return out;
+};
+const subagentTokensOrNull = (v) => {
+  if (!Array.isArray(v)) return null;
+  const rows = v.map(tokenRowOrNull).filter(Boolean).slice(0, 8);
+  return rows.length ? rows : null;
+};
 // branch_key: 'b-' + 12 hex (keyed hash). git_branch: only when the org has
 // turned on sharing git refs; a plain branch name, no slashes-traversal junk.
 const BRANCH_KEY_RE = /^b-[a-f0-9]{12}$/;
@@ -818,6 +846,9 @@ function enforceRecordDetailed(raw, opts = {}) {
     mcp_servers_used: extensionCallsOrEmpty(r.mcp_servers_used),
     cache_rebuilds: cacheRebuildsOrNull(r.cache_rebuilds),
     limit_hits: limitHitsOrZeros(r.limit_hits),
+    phase_costs: phaseCostsOrNull(r.phase_costs),
+    subagent_tokens: subagentTokensOrNull(r.subagent_tokens),
+    phase_costs_approximate: r.phase_costs_approximate === true,
     branch_key: typeof r.branch_key === 'string' && BRANCH_KEY_RE.test(r.branch_key) ? r.branch_key : '',
     git_branch: typeof r.git_branch === 'string' && GIT_BRANCH_RE.test(r.git_branch) && !r.git_branch.includes('..') ? r.git_branch : '',
     // A7/D2: classification provenance, trust tier, cost, and the versioned
@@ -983,6 +1014,12 @@ const SCHEMA_FIELDS = [
     note: 'Prompt-cache rebuilds: calls that re-wrote at least half of a 20k+ token context. Counts and tokens by likely cause (start, idle over 1 hour, idle 5 to 60 minutes, model switch, other), the tokens of the avoidable ones by cache tier, their dollar cost over reading the same tokens from cache (re-derived by the server from those tokens), and the share written to the 5-minute tier. Numbers only.' },
   { name: 'limit_hits', type: 'object',
     note: 'How many times Claude Code showed a usage-limit notice in the session, by kind (weekly, session, model, spend, other). Counts only.' },
+  { name: 'phase_costs', type: 'object',
+    note: 'Where the session\'s tokens went, by development phase (explore, plan, build, verify, ship, operate, think, unclear), worked out on the laptop from which tools each API call used. Per phase: the number of calls, the average context re-sent per call, and token counts per model. Numbers and model ids only; no commands, files or text.' },
+  { name: 'phase_costs_approximate', type: 'bool',
+    note: 'True when the session had fast-mode turns: phase costs are then priced at one speed and shown as approximate.' },
+  { name: 'subagent_tokens', type: 'object',
+    note: 'Token counts per model for the session\'s subagents (work handed to the Task/Agent tool), which are also included in the session\'s totals and phases. Numbers and model ids only.' },
   { name: 'branch_key', type: 'string', shape: BRANCH_KEY_RE.source,
     note: 'A keyed hash of the repository and git branch the session ran on, so sessions on the same branch of the same repo can be grouped without the branch name leaving the machine. Empty when unknown.' },
   { name: 'git_branch', type: 'string', shape: GIT_BRANCH_RE.source,

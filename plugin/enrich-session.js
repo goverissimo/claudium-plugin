@@ -39,7 +39,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { sessionize } = require('./lib/sessionize');
+const { sessionize, mergeSubagents, subagentSessions } = require('./lib/sessionize');
 const { computeMetrics } = require('./lib/metrics');
 const { buildRecord } = require('./lib/record');
 const { classify } = require('./lib/classify-headless');
@@ -73,6 +73,8 @@ async function assembleSession(filepath, claudeDir) {
     claudeSessionId: path.basename(filepath, '.jsonl'),
   });
   if (!session.turnCount) return null;
+  // Subagent spend belongs to this session (lib/sessionize.js mergeSubagents).
+  mergeSubagents(session, subagentSessions(filepath));
   return session;
 }
 

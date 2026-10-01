@@ -27,7 +27,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
-const { sessionize } = require('./lib/sessionize');
+const { sessionize, mergeSubagents, subagentSessions } = require('./lib/sessionize');
 const { computeMetrics } = require('./lib/metrics');
 const { fallbackAbstraction } = require('./lib/extract');
 const { buildRecord } = require('./lib/record');
@@ -168,6 +168,8 @@ async function buildFor(filepath, claudeDir, { projectLabels, tokenomicaDir = TO
     claudeSessionId: path.basename(filepath, '.jsonl'),
   });
   if (!session.turnCount) return null;
+  // Subagent spend belongs to this session (lib/sessionize.js mergeSubagents).
+  mergeSubagents(session, subagentSessions(filepath));
   const metrics = computeMetrics(session);
   const abstraction = fallbackAbstraction(session);
   let truth = null;

@@ -11,6 +11,8 @@
 // tool-result snippets) for LOCAL analysis by lib/extract.js only. None of it
 // is ever shipped — lib/record.js + lib/scrub.js decide what crosses the wire.
 
+const { phasesOfCall } = require('./phase');
+
 const TEXT_CAP = 4000;        // max chars kept per text bucket (local-only)
 const RESULT_CAP = 2000;      // max chars kept per tool-result (local-only)
 
@@ -138,6 +140,11 @@ function sessionize(lines, { claudeSessionId = '', projectLabel = '' } = {}) {
   // servers (the server part of an mcp__<server>__<tool> name). LOCAL: names
   // are filtered/hashed in lib/record.js before anything ships.
   const skillCalls = new Map();
+  // Per API response, for the spend pipeline (lib/phase.js): its model, its
+  // tool calls and its tokens. Keyed by message id, because one response is
+  // written across several lines (text, then each tool_use). LOCAL ONLY:
+  // tool inputs are classified at the end and dropped.
+  const callsById = new Map();
   const mcpServerCalls = new Map();
   // Cache economics per API call. A "rebuild" is a response that wrote most of
   // its context back to the cache (the prefix had expired or changed). Kept
@@ -180,6 +187,26 @@ function sessionize(lines, { claudeSessionId = '', projectLabel = '' } = {}) {
       const msgId = msg.id || `anon-${anonMsgSeq++}`;
       const firstLineOfMsg = !seenMsgIds.has(msgId);
       seenMsgIds.add(msgId);
+      if (msg.model !== '<synthetic>') {
+        let call = callsById.get(msgId);
+        if (!call) {
+          const u0 = msg.usage || {};
+          const cc0 = u0.cache_creation || {};
+          const w5 = cc0.ephemeral_5m_input_tokens || 0, w1 = cc0.ephemeral_1h_input_tokens || 0;
+          const flat = u0.cache_creation_input_tokens || 0;
+          call = {
+            model: msg.model || '', tools: [],
+            input: u0.input_tokens || 0, output: u0.output_tokens || 0, cache_read: u0.cache_read_input_tokens || 0,
+            // No 5m/1h split reported: the flat write counts as 1h, like the
+            // server's legacy pricing.
+            cache_write_5m: w5 + w1 > 0 ? w5 : 0, cache_write_1h: w5 + w1 > 0 ? w1 : flat,
+          };
+          callsById.set(msgId, call);
+        }
+        for (const b of Array.isArray(msg.content) ? msg.content : []) {
+          if (b && b.type === 'tool_use') call.tools.push({ name: b.name, input: b.input });
+        }
+      }
       // '<synthetic>' is Claude Code's own zero-token placeholder (a limit
       // notice, an interrupted turn), not a model. Letting it win the last-
       // model-seen race left the whole session unpriced.
@@ -409,6 +436,9 @@ function sessionize(lines, { claudeSessionId = '', projectLabel = '' } = {}) {
     cacheRebuilds,
     limitHits,
     maxParallelTools,
+    // Local only: one entry per API response, tool inputs already reduced to
+    // phases. lib/phase.js phaseCosts() turns these into the shipped totals.
+    calls: [...callsById].map(([id, { tools, ...c }]) => ({ ...c, id, phases: phasesOfCall(tools) })),
     // local-only text (never shipped):
     userTexts,
     promptTexts,
@@ -420,4 +450,51 @@ function sessionize(lines, { claudeSessionId = '', projectLabel = '' } = {}) {
   };
 }
 
-module.exports = { sessionize, hasCode, resultText, filePathOf, isInjectedText };
+
+// Subagents (Task/Agent tool) write their own transcripts beside the session:
+// <dir>/<session id>/subagents/*.jsonl. Their calls are real spend — on one
+// machine a third of a session's tokens — so they count toward the session's
+// totals and its phase split, under their own model. Read locally; never
+// shipped.
+function subagentSessions(transcriptPath) {
+  if (!transcriptPath) return [];
+  const fs = require('fs');
+  const path = require('path');
+  const dir = path.join(path.dirname(transcriptPath), path.basename(transcriptPath, '.jsonl'), 'subagents');
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  const out = [];
+  for (const n of names) {
+    if (!n.endsWith('.jsonl')) continue;
+    try { out.push(sessionize(fs.readFileSync(path.join(dir, n), 'utf8').split('\n').filter(l => l.trim()))); } catch { /* unreadable: skip */ }
+  }
+  return out;
+}
+
+function mergeSubagents(session, subs) {
+  session.subagentCalls = [];
+  // A forked subagent's transcript opens with a copy of the parent's
+  // launching response (same message id, same usage). Every response is
+  // counted once across the session and all its subagents, so the counters
+  // grow by each NEW response's own tokens, not by each file's totals.
+  const seen = new Set(session.calls.map(c => c.id).filter(Boolean));
+  for (const sub of Array.isArray(subs) ? subs : []) {
+    if (!sub || !Array.isArray(sub.calls)) continue;
+    for (const c of sub.calls) {
+      if (c.id && seen.has(c.id)) continue;
+      if (c.id) seen.add(c.id);
+      session.calls.push(c);
+      session.subagentCalls.push(c);
+      session.inputTokens += c.input || 0;
+      session.tokenTotal += c.output || 0;
+      session.cacheReadTokens += c.cache_read || 0;
+      session.cacheCreation5mTokens += c.cache_write_5m || 0;
+      session.cacheCreation1hTokens += c.cache_write_1h || 0;
+      session.cacheCreationTokens += (c.cache_write_5m || 0) + (c.cache_write_1h || 0);
+    }
+    session.outputTokens = session.tokenTotal;
+  }
+  return session;
+}
+
+module.exports = { sessionize, mergeSubagents, subagentSessions, hasCode, resultText, filePathOf, isInjectedText };

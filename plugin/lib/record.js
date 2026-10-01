@@ -25,6 +25,7 @@ const { toolToRegion } = require('./regions');
 const { segmentTasks } = require('./task-path');
 const { canonicalModel, rebuildAvoidableUsd } = require('./pricing');
 const { shipExtensionCalls } = require('./extensions');
+const { phaseCosts, TOKEN_KEYS } = require('./phase');
 
 // Cache rebuilds grouped by their likely cause. `start` is the first call of a
 // session (a cold cache is unavoidable there); the rest are what a habit or a
@@ -181,6 +182,21 @@ function regionCounts(session) {
   return counts;
 }
 
+// Model ids ship in their canonical form, like the record's own `model`.
+function canonicalPhaseCosts(pc) {
+  for (const p of Object.values(pc)) {
+    const merged = new Map();
+    for (const row of p.by_model) {
+      const id = canonicalModel(row.model);
+      const m = merged.get(id) || { model: id, ...Object.fromEntries(TOKEN_KEYS.map(k => [k, 0])) };
+      for (const k of TOKEN_KEYS) m[k] += row[k];
+      merged.set(id, m);
+    }
+    p.by_model = [...merged.values()];
+  }
+  return pc;
+}
+
 // gitTruth is optional: the output of lib/git-truth.js analyzeGitTruth(),
 // computed sender-side where the repo exists. coachNudges is the list of
 // live-coach tips shown during this session (lib/coach-ledger.js). salt +
@@ -285,6 +301,16 @@ function buildRecord({ session, metrics, abstraction = {}, gitTruth = null, coac
     mcp_servers_used: shipExtensionCalls(session.mcpServerCalls, { salt: orgSalt || salt, kind: 'mcp' }),
     cache_rebuilds: summarizeRebuilds(session.cacheRebuilds, { model: session.model, at: session.startedAt, speed: session.speed }),
     limit_hits: summarizeLimitHits(session.limitHits),
+    // The spend pipeline: tokens per development phase and per model
+    // (lib/phase.js). Subagent calls are included (lib/sessionize.js
+    // mergeSubagents) and also summed on their own.
+    phase_costs: Array.isArray(session.calls) && session.calls.length
+      ? canonicalPhaseCosts(phaseCosts(session.calls)) : null,
+    // Phases don't track fast vs standard turns, so a session with any fast
+    // turn has its phase dollars priced at one speed: say so on the page.
+    phase_costs_approximate: !!(session.fastTokens && Object.values(session.fastTokens).some(v => v > 0)),
+    subagent_tokens: Array.isArray(session.subagentCalls) && session.subagentCalls.length
+      ? canonicalPhaseCosts(phaseCosts(session.subagentCalls.map(c => ({ ...c, phases: ['think'] })))).think.by_model : null,
     // Scoped to the repo: every repo has a "main", and "other sessions on
     // this branch" must not pull in the rest of the org's repos.
     branch_key: session.gitBranch && (orgSalt || salt)
