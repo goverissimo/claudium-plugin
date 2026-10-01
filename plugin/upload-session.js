@@ -483,6 +483,39 @@ function spawnFinish(fp, claudeDir, { spawnImpl = spawn } = {}) {
   }
 }
 
+// THE TICK. SessionEnd only fires when a session closes, and people keep
+// sessions open for days: on one real machine, ten sessions had been open for
+// up to nine days, so the dashboard showed nothing new while the plugin was
+// installed, enabled and connected. So the plugin also runs on SessionStart
+// and Stop (after each Claude turn), throttled to once per TICK_MS per
+// machine. A tick does no work in-process either: it spawns the same detached
+// finisher with no transcript, whose reconciliation sweep picks up every
+// session that is new or has grown since it was last queued, open ones
+// included, and delivers the queue. Nothing is printed: SessionStart stdout
+// would land in Claude's context, and a tick has nothing to say.
+const TICK_FILE = 'last-tick';
+const TICK_MS = 10 * 60 * 1000;
+function claimTick(dir, now = Date.now()) {
+  const file = path.join(dir, TICK_FILE);
+  try {
+    const last = Number(String(fs.readFileSync(file, 'utf8')).trim());
+    if (Number.isFinite(last) && last <= now && now - last < TICK_MS) return false;
+  } catch { /* first tick on this machine */ }
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, String(now), { mode: 0o600 });
+  } catch { return false; }   // can't record it: don't risk a tick on every turn
+  return true;
+}
+
+async function runTick(opts = {}) {
+  if (process.env.TOKENOMICA_CLASSIFYING) return;   // never from the classifier's own `claude -p`
+  const cfg = loadConfig(opts.configPath);
+  if (!cfg) return;   // runs every turn: stay quiet; SessionEnd says "not connected"
+  if (!claimTick(opts.tokenomicaDir || stateDir(cfg), opts.now)) return;
+  spawnFinish('', CLAUDE_DIR, opts);
+}
+
 // The SessionEnd hook itself. It must finish in well under the CLI's ~1.5s
 // grace window or it is cancelled AND its process tree is killed — so it
 // does no network, git, or transcript work at all: guard, load config, read
@@ -534,7 +567,8 @@ async function runFinish({ filepath = '', claudeDir = CLAUDE_DIR, configPath = C
   // classify isn't turned off — spawn the fully detached enrichment child,
   // whose richer record replaces this one in the queue.
   if (filepath) await uploadAndEnrich(filepath, claudeDir, cfg, { fetchImpl, spawnImpl });
-  else console.error('tokenomica: hook input had no transcript_path');
+  // No transcript: a tick (see runTick), or a SessionEnd without one. The
+  // sweep below still picks up every new or grown session.
   const backfillOpts = {};
   if (markerFile) backfillOpts.markerFile = markerFile;
   if (noticeFile) backfillOpts.noticeFile = noticeFile;
@@ -901,7 +935,7 @@ async function runStatus(fetchImpl = globalThis.fetch, { configPath = CONFIG_PAT
   }
 }
 
-module.exports = { loadConfig, buildFor, uploadOne, uploadAndEnrich, spawnEnrich, spawnFinish, runHook, runFinish,
+module.exports = { loadConfig, buildFor, uploadOne, uploadAndEnrich, spawnEnrich, spawnFinish, runHook, runTick, runFinish, TICK_MS,
   runBackfill, backfillAll, maybeAutoBackfill, runStatus, classifyProbe, runResurvey, runResurveyCommand,
   flushOutbox, ensureOrgSalt, runSweep, PLUGIN_VERSION, CONFIG_PATH, MARKER_PATH };
 
@@ -914,6 +948,7 @@ if (require.main === module) {
   const main = process.argv.includes('--backfill') ? () => runBackfill({ skip: process.argv.includes('--skip') })
     : process.argv.includes('--status') ? runStatus
     : process.argv.includes('--resurvey') ? runResurveyCommand
+    : process.argv.includes('--tick') ? runTick
     : runHook;
   main().then(() => process.exit(0)).catch(e => { console.error(`tokenomica: ${e.message}`); process.exit(0); });
 }

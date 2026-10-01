@@ -1,7 +1,7 @@
 {
   "name": "tokenomica",
-  "description": "Uploads privacy-scrubbed Claude Code usage records to your team’s Tokenomica dashboard when a session ends. Every session is captured durably and retried until it lands — offline, VPN, or dashboard outage. Raw transcripts never leave your machine.",
-  "version": "1.7.0",
+  "description": "Uploads privacy-scrubbed Claude Code usage records to your team’s Tokenomica dashboard as you work: when a session ends and every few minutes while sessions are open. Every session is captured durably and retried until it lands — offline, VPN, or dashboard outage. Raw transcripts never leave your machine.",
+  "version": "1.7.1",
   "author": {
     "name": "Tokenomica"
   },

@@ -2,8 +2,8 @@
 
 Tokenomica is a team dashboard for Claude Code usage: sessions, costs, prompt
 quality, burn rate, and coaching recommendations. This plugin uploads a
-privacy-scrubbed usage record to your team’s Tokenomica dashboard every time a
-Claude Code session ends.
+privacy-scrubbed usage record to your team’s Tokenomica dashboard as you work:
+when a session ends, and every few minutes while sessions are open.
 
 ## Install
 
@@ -118,6 +118,13 @@ accepts your token. If anything is queued and you are online, running it
 delivers the backlog then and there.
 
 ## Every session is captured
+
+Sessions don't have to close to show up. People keep sessions open for days,
+so besides the session-end upload the plugin also wakes when a session starts
+and after each Claude reply, at most once every 10 minutes per machine, and
+sends whatever is new: sessions that started since, and open sessions that
+have done more work since they were last sent. It runs in the background and
+never slows a reply.
 
 The plugin does not fire a single upload and hope. When a session ends the
 record is written to a durable queue on your machine **before** any network

@@ -2,6 +2,6 @@
   "name": "tokenomica",
   "owner": { "name": "Tokenomica" },
   "plugins": [
-    { "name": "tokenomica", "source": "./plugin", "description": "Tokenomica usage uploader — session-end hook" }
+    { "name": "tokenomica", "source": "./plugin", "description": "Tokenomica usage uploader" }
   ]
 }

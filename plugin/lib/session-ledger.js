@@ -45,6 +45,13 @@ const LEDGER_RETAIN_DAYS = 60;
 // Bound the work one run does; a large backlog drains over several sessions
 // rather than stalling one.
 const DEFAULT_MAX_PER_RUN = 15;
+// A session already queued is swept AGAIN once its transcript has grown past
+// this margin since it was queued. People keep sessions open for days; without
+// this, a session queued once (at an earlier session end, or by the sweep)
+// never shows its later work until it finally closes. The margin keeps an
+// open-but-idle session (Claude Code still writes small status lines to it)
+// from being rebuilt on every run.
+const GROWTH_MARGIN_MS = 5 * 60 * 1000;
 
 const DAY_MS = 86400000;
 
@@ -195,7 +202,7 @@ function findMissed({ dir, claudeDir, skip, isPending = () => false,
   const ledger = loadLedger(dir);
   return listLocalSessions(claudeDir, { skip })
     .filter(s => s.endedAtMs >= since)
-    .filter(s => !(s.id in ledger))
+    .filter(s => !(s.id in ledger) || s.endedAtMs > ledger[s.id] + GROWTH_MARGIN_MS)
     .filter(s => !isPending(s.id))
     .sort((a, b) => b.endedAtMs - a.endedAtMs)
     .slice(0, max);
@@ -204,5 +211,5 @@ function findMissed({ dir, claudeDir, skip, isPending = () => false,
 module.exports = {
   findMissed, listLocalSessions, markQueued, loadLedger, saveLedger, sweepSince, resurveyFloor,
   LEDGER_FILE, SINCE_FILE, DEFAULT_WINDOW_DAYS, LEDGER_RETAIN_DAYS, DEFAULT_MAX_PER_RUN,
-  SWEEP_GRACE_MS,
+  SWEEP_GRACE_MS, GROWTH_MARGIN_MS,
 };
