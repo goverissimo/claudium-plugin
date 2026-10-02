@@ -141,13 +141,15 @@ const ORG_POLICY_FILE = 'org-policy.json';
 function loadOrgPolicy(dir = configDir()) {
   try {
     const j = JSON.parse(fs.readFileSync(path.join(dir, ORG_POLICY_FILE), 'utf8'));
-    return { shareGitRefs: j && j.share_git_refs === true, fetchedAt: j && j.fetched_at || null };
-  } catch { return { shareGitRefs: false, fetchedAt: null }; }
+    return { shareGitRefs: j && j.share_git_refs === true, shareRepoNames: j && j.share_repo_names === true,
+      fetchedAt: j && j.fetched_at || null };
+  } catch { return { shareGitRefs: false, shareRepoNames: false, fetchedAt: null }; }
 }
 function saveOrgPolicy(policy, dir = configDir(), now = Date.now()) {
   try {
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, ORG_POLICY_FILE), JSON.stringify({ share_git_refs: !!(policy && policy.share_git_refs), fetched_at: new Date(now).toISOString() }), { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, ORG_POLICY_FILE), JSON.stringify({ share_git_refs: !!(policy && policy.share_git_refs),
+      share_repo_names: !!(policy && policy.share_repo_names), fetched_at: new Date(now).toISOString() }), { mode: 0o600 });
   } catch { /* best-effort; the default is the safe side */ }
 }
 

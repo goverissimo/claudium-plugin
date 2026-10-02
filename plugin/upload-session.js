@@ -330,7 +330,8 @@ async function ensureOrgSalt(cfg, { fetchImpl = globalThis.fetch, now = Date.now
     const body = await r.json();
     // A server that predates the setting doesn't send it: that means "off",
     // and caching it keeps this to one fetch per POLICY_TTL_MS either way.
-    saveOrgPolicy({ share_git_refs: !!(body && body.share_git_refs === true) }, dir, now);
+    saveOrgPolicy({ share_git_refs: !!(body && body.share_git_refs === true),
+      share_repo_names: !!(body && body.share_repo_names === true) }, dir, now);
     return haveSalt || !!saveOrgSalt(body && body.project_salt, dir);
   } catch { expireStalePolicy(pol, dir, now); return haveSalt; }
 }
@@ -340,8 +341,8 @@ async function ensureOrgSalt(cfg, { fetchImpl = globalThis.fetch, now = Date.now
 // cannot reach the server. Turning it back on only needs one good fetch.
 const POLICY_MAX_STALE_MS = 24 * 3600 * 1000;
 function expireStalePolicy(pol, dir, now) {
-  if (pol.shareGitRefs && (!pol.fetchedAt || now - Date.parse(pol.fetchedAt) > POLICY_MAX_STALE_MS)) {
-    saveOrgPolicy({ share_git_refs: false }, dir, Date.parse(pol.fetchedAt) || 0);
+  if ((pol.shareGitRefs || pol.shareRepoNames) && (!pol.fetchedAt || now - Date.parse(pol.fetchedAt) > POLICY_MAX_STALE_MS)) {
+    saveOrgPolicy({ share_git_refs: false, share_repo_names: false }, dir, Date.parse(pol.fetchedAt) || 0);
   }
 }
 

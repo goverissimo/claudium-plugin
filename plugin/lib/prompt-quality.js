@@ -132,11 +132,11 @@ function detectPromptAntipatterns(session) {
 
 // Human-readable advice per antipattern — used by reports and the coach.
 const ANTIPATTERN_ADVICE = {
-  vague_goal: 'State what you want changed and where — name the file, feature, or error.',
+  vague_goal: 'State what you want changed and where. Name the file, feature, or error.',
   no_success_criteria: 'Say what "done" looks like (a passing test, a behavior, an output) so Claude can verify instead of guessing.',
   missing_context: 'Point at the code: paste the error, name the file or function. Claude spent many turns just finding it.',
   scope_creep: 'New unrelated asks mid-session dilute context. Finish the task, then /clear and start the next one fresh.',
-  correction_loop: 'Several "no, I meant..." corrections — front-load constraints in the first prompt or use plan mode to agree on an approach first.',
+  correction_loop: 'Several "no, I meant..." corrections. Front-load constraints in the first prompt or use plan mode to agree on an approach first.',
   kitchen_sink: 'One prompt carried several distinct tasks. Split them: sequential focused asks finish faster than one mega-prompt.',
 };
 

@@ -316,6 +316,10 @@ function buildRecord({ session, metrics, abstraction = {}, gitTruth = null, coac
     branch_key: session.gitBranch && (orgSalt || salt)
       ? 'b-' + hmac12(orgSalt || salt, `${projectKey || session.cwd || ''}\0${session.gitBranch}`) : '',
     git_branch: orgPolicy.shareGitRefs ? String(session.gitBranch || '').slice(0, 80) : '',
+    // The repo's name (the last part of its remote, never the owner or host),
+    // only when an org admin turned on sharing repo names. The project's ID
+    // (project_label) is unchanged; the dashboard shows this next to it.
+    repo_name: orgPolicy.shareRepoNames && projectKey ? sanitizeLabel(repoName(projectKey)) : '',
     max_parallel_tools: session.maxParallelTools,
     permission_mode: session.permissionMode,
     // coach feedback loop
@@ -404,4 +408,11 @@ function withoutGitRefs(rec) {
   return out;
 }
 
-module.exports = { buildRecord, validateRecord, validateRecordDetailed, withoutGitRefs };
+// Same rule for repo names: shared only while the org shares them, enforced
+// by the server on the way in and out.
+function withoutRepoName(rec) {
+  if (!rec || typeof rec !== 'object') return rec;
+  return { ...rec, repo_name: '' };
+}
+
+module.exports = { buildRecord, validateRecord, validateRecordDetailed, withoutGitRefs, withoutRepoName };

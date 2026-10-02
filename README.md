@@ -190,6 +190,11 @@ back to the per-machine pseudonym as before.
   what the subagents spent.
 - A keyed hash of your git branch, so sessions on the same branch can be
   grouped without the branch name leaving your machine.
+- Only if an admin of your organization turns on **showing repo names** (off
+  by default; Team page): the repo's name, just the last part of its remote
+  (e.g. `checkout`), never the owner, host or URL. It shows next to the
+  project's ID on the dashboard. Anyone in the org can also rename a project
+  on the Projects page, with nothing sent from laptops at all.
 - Only if an admin of your organization turns on **sharing git refs** (off by
   default; Team page on the dashboard): the branch name and each task's short
   commit ids, so a session links to the commits it produced. Commit messages,

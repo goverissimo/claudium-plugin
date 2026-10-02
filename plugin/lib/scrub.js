@@ -415,6 +415,9 @@ const subagentTokensOrNull = (v) => {
 const BRANCH_KEY_RE = /^b-[a-f0-9]{12}$/;
 const GIT_BRANCH_RE = /^[A-Za-z0-9._\/-]{1,80}$/;
 const COMMIT_ID_RE = /^[0-9a-f]{7,12}$/;
+// repo_name: the last part of a git remote, lowercased and sanitized
+// (lib/anonymize.js sanitizeLabel), only when an org opted in.
+const REPO_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,39}$/;
 
 // tasks: each entry must be well-formed or it is dropped (a task is a unit of
 // meaning, so a half-valid one is worse than none). Counts clamp like every
@@ -851,6 +854,7 @@ function enforceRecordDetailed(raw, opts = {}) {
     phase_costs_approximate: r.phase_costs_approximate === true,
     branch_key: typeof r.branch_key === 'string' && BRANCH_KEY_RE.test(r.branch_key) ? r.branch_key : '',
     git_branch: typeof r.git_branch === 'string' && GIT_BRANCH_RE.test(r.git_branch) && !r.git_branch.includes('..') ? r.git_branch : '',
+    repo_name: typeof r.repo_name === 'string' && REPO_NAME_RE.test(r.repo_name) ? r.repo_name : '',
     // A7/D2: classification provenance, trust tier, cost, and the versioned
     // region profile. classifier/trust_tier fail closed to the
     // no-independent-evidence defaults ('deterministic'/'self_reported') —
@@ -1024,6 +1028,8 @@ const SCHEMA_FIELDS = [
     note: 'A keyed hash of the repository and git branch the session ran on, so sessions on the same branch of the same repo can be grouped without the branch name leaving the machine. Empty when unknown.' },
   { name: 'git_branch', type: 'string', shape: GIT_BRANCH_RE.source,
     note: 'The git branch name. Empty unless an org admin turned on sharing git refs for the team (off by default); tasks then also carry their short commit ids.' },
+  { name: 'repo_name', type: 'string', shape: REPO_NAME_RE.source,
+    note: 'The repository\'s name (the last part of its git remote, e.g. "checkout"; never the owner, host or URL). Empty unless an org admin turned on sharing repo names (off by default), so the dashboard can show a readable name next to the project ID.' },
   { name: 'is_continuation', type: 'bool',
     note: 'Whether this session continued an earlier session (e.g. via --continue or --resume).' },
   { name: 'compactions', type: 'int',
